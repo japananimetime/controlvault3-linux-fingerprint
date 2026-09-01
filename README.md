@@ -35,6 +35,9 @@ sudo -k && sudo id                 # -> "Touch the fingerprint sensor"
 
 - **`cvchan`** with no args = enroll; `cvchan verify` = one-shot match; `cvchan reset` = clear a
   stuck enrollment.
+- **Enroll deliberately.** Press firmly and fully on each of the ~12 taps and shift the contact
+  point slightly between them (center, then a little left/right/up/down). A rushed enroll makes a
+  weak template that matches inconsistently; a careful one matches every time.
 - **`pam/install.sh`** builds the `pam_cvfp.so` module + the `cvfp-verify` helper, masks the
   (non-functional) `fprintd`, and adds a `sufficient` fingerprint line to `sudo`, `login`, and
   `polkit-1` — **password always stays as the fallback, you can't be locked out.**
