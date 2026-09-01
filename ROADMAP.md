@@ -1,45 +1,42 @@
 # Roadmap
 
-## v1 (this repo): keyless enroll/verify + PAM  — done
-Works today: `sudo`, `polkit`, PAM-based greeters/lockers via `pam_cvfp.so`; i3lock via the
-`cvlock` watcher. Not integrated with `fprintd`/`libfprint`.
+## v1: keyless enroll/verify + standalone PAM — done
+`sudo`, `polkit`, PAM-based greeters/lockers via `pam_cvfp.so`; i3lock via the `cvlock` watcher.
+Ships as **path B** in the README — for systems without `fprintd`, or where you would rather not
+run it. It owns the USB device directly, so it is mutually exclusive with v2.
 
-## v2 (headline): a libfprint TOD driver — **done**
+## v2 (headline): a libfprint TOD driver — done
+Shipped as `driver/cvfp-tod.c`, so `fprintd`, `pam_fprintd` and the desktop fingerprint panels
+drive the sensor with no custom PAM module and no lock-screen watcher. Drop one `.so` into
+`/usr/lib/libfprint-2/tod-1/`; **no libfprint rebuild needed**.
 
-Shipped as `driver/cvfp-tod.c`. Fully asynchronous (every USB transfer via
-`fpi_usb_transfer_submit`, one `fpi_ssm` per operation, nothing blocks the main loop), so
-`fprintd` Claim/EnrollStart/VerifyStart return immediately and cancellation unwinds cleanly.
-Validated end to end: `fprintd-enroll` 12 stages, `fprintd-verify` -> `verify-match`, device
-left healthy. `pam_fprintd` then covers `sudo`, greeters, `polkit`, and PAM lock screens.
+Fully asynchronous: every USB transfer goes through `fpi_usb_transfer_submit` and each operation
+is an `fpi_ssm`, so the main loop never blocks — `Claim`/`EnrollStart`/`VerifyStart` return
+immediately instead of timing out, and cancellation unwinds cleanly.
 
-Turn the reverse-engineered channel into a proper **libfprint TOD driver**, so `fprintd`, the
-GNOME/KDE fingerprint settings panels, and the standard `pam_fprintd` module all drive it — no
-custom PAM lines, no lock-screen watcher. Users install one `.so` and enroll in their Settings app.
+Validated end to end on a Dell Latitude 5531: `fprintd-enroll` completes 12 stages,
+`fprintd-verify` reports `verify-match`, `sudo` authenticates through `pam_fprintd`, and the
+device is left healthy.
 
-**Feasibility (confirmed by a spike):**
-- The system already ships a TOD-enabled `libfprint` (`libfprint-tod`), the TOD driver headers
-  (`/usr/include/libfprint-2/tod-1/drivers_api.h`), and a drop-in slot — Dell's non-working
-  `libfprint-2-tod-1-broadcom.so`. A minimal `FpiDeviceClass` driver compiles cleanly against
-  them (deps: `glib-2.0 gobject-2.0 gusb`). **No libfprint rebuild needed.**
+**How the protocol (see `docs/secure-channel.md`) maps to `FpiDeviceClass`:**
+| vfunc | sequence | status |
+|---|---|---|
+| `probe` | match USB `0a5c:5843` | done |
+| `open` | `0x23`/`0x24` handshake (ephemeral key) + `0x02` open | done |
+| `verify` | `0x66` capture → async `0x03` → `0x73` match | done |
+| `enroll` | `0x6D` discard → `0x8A` → (`0x66`→async→`0x6C`)×N → `0x6E` commit | done |
+| `close` | `0x68` cancel + `0x04` close | done |
+| `list` / `delete` / `identify` | `0x2F` template management | **not implemented** — see below |
 
-**Plan — map our protocol (see `docs/secure-channel.md`) to `FpiDeviceClass` vfuncs:**
-| vfunc | our sequence |
-|---|---|
-| `probe` | match USB `0a5c:5843` |
-| `open` | `0x23`/`0x24` handshake (ephemeral key) + `0x02` open, as an `fpi_ssm` |
-| `verify` / `identify` | `0x66` capture → async `0x03` → `0x73` match; report result |
-| `enroll` | `0x6D` discard → `0x8A` → (`0x66`→async→`0x6C`)×N → completion → `0x6E` commit, reporting stage progress to libfprint |
-| `list` / `delete` / `clear_storage` | `0x2F` and template management; store the device template id in the `FpPrint` blob |
-| `close` | `0x04` close |
-
-**Effort:** ~4–6 focused sessions + hardware testing (roughly a week). Main detail work: porting
-our blocking flow to libfprint's async state machines, and mapping on-chip templates to `FpPrint`
-(the stock broadcom driver is a reference for the latter).
-
-**Upstreaming:** once working, propose to the libfprint maintainers. Users can use the TOD `.so`
-before any upstream merge.
-
-## Also welcome
-- Confirm/adjust for other ControlVault 3 units and USB IDs.
-- A `udev` rule instead of setuid for the v1 helper's device access.
-- Packaging (AUR) for both v1 and the v2 driver.
+## v3 / help wanted
+- **Other ControlVault 3 units and USB IDs.** Everything here was developed against a single
+  Dell Latitude 5531 (`0a5c:5843`). Other CV3 units very likely work; `0a5c:5842/5844/5845` are
+  probably close but untested. Reports either way are the most valuable contribution.
+- **Packaging** (AUR and friends) — straightforward now that it is keyless.
+- **Upstreaming the driver into libfprint**, so affected laptops work out of the box. The MIT
+  licence here is deliberately compatible with libfprint's LGPL-2.1+.
+- **On-device template storage.** The driver uses host storage (`FP_DEVICE_FEATURE_VERIFY`) and
+  trusts the chip's match flag, which is authoritative — the chip only matches fingers actually
+  in its store. `list`/`delete`/`identify` additionally need a `0x2F` store diff to map the
+  chip's stable biometric-derived ids to enrollments; see the notes in `driver/cvfp-tod.c`.
+- A `udev` rule instead of setuid for the v1 helper's device access (path B only).

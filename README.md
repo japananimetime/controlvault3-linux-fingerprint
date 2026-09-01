@@ -129,13 +129,19 @@ windows/       appendix: how it was discovered (NOT needed to use it)
 - One device family tested. **Try it, report back**, and please don't publish anyone's keys.
 
 ## Roadmap & help wanted
-The headline next step is a **libfprint TOD driver** so this works through `fprintd` and every
-desktop's built-in fingerprint support (no PAM edits, no watcher). Feasibility is confirmed; see
-[ROADMAP.md](ROADMAP.md).
+The libfprint TOD driver is **done** — `fprintd`, `pam_fprintd` and the desktop fingerprint
+panels all drive the sensor, with no custom PAM module and no watcher. See [ROADMAP.md](ROADMAP.md).
 
-- Confirm/adjust for other ControlVault 3 units and USB IDs.
-- A `udev` rule instead of setuid for device access.
-- Package it (AUR, etc.) now that it's keyless.
+Where help is genuinely useful:
+
+- **Other ControlVault 3 units and USB IDs.** All of this was developed against one Dell Latitude
+  5531 (`0a5c:5843`). Other CV3 units very likely work; `0a5c:5842/5844/5845` are probably close
+  but untested. **Reports either way are the most valuable thing you can contribute.**
+- **Packaging** (AUR and friends), now that it is keyless and needs no libfprint rebuild.
+- **Upstreaming the driver into libfprint**, so affected laptops work out of the box.
+- **On-device template storage** — `list`/`delete`/`identify` need a `0x2F` store diff; see
+  [ROADMAP.md](ROADMAP.md).
+- A `udev` rule instead of setuid for the standalone helper (path B only).
 
 ## License
 MIT (see LICENSE). Interoperability reverse-engineering of your own hardware. Not affiliated with
