@@ -4,7 +4,14 @@
 Works today: `sudo`, `polkit`, PAM-based greeters/lockers via `pam_cvfp.so`; i3lock via the
 `cvlock` watcher. Not integrated with `fprintd`/`libfprint`.
 
-## v2 (headline): a libfprint TOD driver — make it a first-class reader
+## v2 (headline): a libfprint TOD driver — **done**
+
+Shipped as `driver/cvfp-tod.c`. Fully asynchronous (every USB transfer via
+`fpi_usb_transfer_submit`, one `fpi_ssm` per operation, nothing blocks the main loop), so
+`fprintd` Claim/EnrollStart/VerifyStart return immediately and cancellation unwinds cleanly.
+Validated end to end: `fprintd-enroll` 12 stages, `fprintd-verify` -> `verify-match`, device
+left healthy. `pam_fprintd` then covers `sudo`, greeters, `polkit`, and PAM lock screens.
+
 Turn the reverse-engineered channel into a proper **libfprint TOD driver**, so `fprintd`, the
 GNOME/KDE fingerprint settings panels, and the standard `pam_fprintd` module all drive it — no
 custom PAM lines, no lock-screen watcher. Users install one `.so` and enroll in their Settings app.

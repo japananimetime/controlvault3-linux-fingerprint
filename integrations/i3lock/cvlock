@@ -9,16 +9,27 @@ if [ -f "$IMG" ]; then i3lock --nofork -i "$IMG" "$@" &
 else                   i3lock --nofork --blur "$BLUR" "$@" & fi
 LOCKPID=$!
 
-# Fingerprint watcher: while locked, wait on the sensor and unlock on a match. cvfp-verify is
-# setuid root. On unlock we SIGTERM the in-flight verify — it cleans up (cancels the capture,
-# closes the session), so the device is released immediately and never left wedged.
+# Fingerprint watcher: while locked, wait on the sensor and unlock on a match.
+#
+# This drives fprintd (the libfprint TOD driver), so fprintd is the ONLY owner of the sensor —
+# the same thing pam_fprintd uses for sudo/ly/polkit. Do not mix this with the standalone
+# pam_cvfp/cvfp-verify path: two owners fight over the device and wedge it.
+#
+# We match on the explicit result string, NOT the exit code: fprintd-verify can exit 0 on a
+# no-match, so trusting $? here would unlock the screen for any finger.
+# On unlock we SIGTERM the in-flight verify so the capture is cancelled and the device released.
 (
   VPID=""
   trap 'kill -TERM "$VPID" 2>/dev/null; exit 0' TERM
+  OUTF=$(mktemp); trap 'rm -f "$OUTF"' EXIT
   while kill -0 "$LOCKPID" 2>/dev/null; do
-    /usr/local/bin/cvfp-verify 8000 >/dev/null 2>&1 &
+    : > "$OUTF"
+    # run in background so $VPID is killable by the TERM trap above
+    timeout 12 fprintd-verify "$USER" > "$OUTF" 2>&1 &
     VPID=$!; wait "$VPID"
-    [ $? -eq 0 ] && { kill "$LOCKPID" 2>/dev/null; break; }
+    if grep -q "Verify result: verify-match" "$OUTF"; then
+      kill "$LOCKPID" 2>/dev/null; break
+    fi
   done
 ) &
 WATCHPID=$!
