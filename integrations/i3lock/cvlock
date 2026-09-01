@@ -1,0 +1,31 @@
+#!/bin/bash
+# cvlock — i3lock-color (blur or image) with fingerprint-to-unlock.
+# Drop a screen-sized PNG at ~/.config/cvlock/lock.png to use an image instead of blur.
+# Set blur strength in ~/.config/cvlock/blur (default 10). Used by mod+l and xss-lock.
+CFG="$HOME/.config/cvlock"
+IMG="$CFG/lock.png"
+BLUR="$(cat "$CFG/blur" 2>/dev/null || echo 10)"
+
+if [ -f "$IMG" ]; then
+    i3lock --nofork -i "$IMG" "$@" &
+else
+    i3lock --nofork --blur "$BLUR" "$@" &
+fi
+LOCKPID=$!
+
+# Fingerprint watcher: while the screen is locked, wait for the enrolled finger and unlock on a
+# match. cvfp-verify is setuid root, so no sudo needed. A tap is detected immediately; when
+# untouched it re-arms every ~8s. Never force-killed, so the sensor is always left clean.
+(
+  while kill -0 "$LOCKPID" 2>/dev/null; do
+    if /usr/local/bin/cvfp-verify 8000 >/dev/null 2>&1; then   # exit 0 = match
+        kill "$LOCKPID" 2>/dev/null
+        break
+    fi
+  done
+) &
+WATCHPID=$!
+
+wait "$LOCKPID"
+kill "$WATCHPID" 2>/dev/null    # its in-flight cvfp-verify finishes cleanly on its own
+exit 0
