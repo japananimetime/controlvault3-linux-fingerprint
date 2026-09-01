@@ -1,5 +1,6 @@
 # build artifacts
-src/cvchan
+tools/cvchan
+tools/cvrecover
 pam/cvfp-verify
 pam/pam_cvfp.so
 *.o

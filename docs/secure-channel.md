@@ -110,8 +110,24 @@ a wrong-finger test returning `0`.
 ## Recovery
 An interrupted session (a killed process leaving a capture armed) wedges the command interface
 (`0x23` bulk-OUT timeout, USB still enumerated). Gentle fix:
-`echo 0 > /sys/bus/usb/devices/<dev>/authorized; sleep 2; echo 1 > .../authorized`. Do **not** use
-the port `disable` knob — it can cause an unrecoverable `error -110` needing a reboot. The tools here defend against it two ways: they install SIGTERM/SIGINT/SIGHUP handlers that
+`echo 0 > /sys/bus/usb/devices/<dev>/authorized; sleep 2; echo 1 > .../authorized`.
+
+Do **not** use the port `disable` knob, and do **not** call `libusb_reset_device()` — they are the
+same USB port reset, and against an already-wedged chip both are *unrecoverable*. Measured
+2026-09-01: the `authorized` toggle re-enumerated the device fine at 17:32:09 (EP0 was healthy —
+only a bulk endpoint was stuck); `libusb_reset_device()` at 17:32:17 killed the BCM58200's USB
+stack outright; from 17:32:23 every enumeration returned `device descriptor read/64, error -110`,
+the kernel's own `usb usb3-port8: attempt power cycle` did nothing, and by 17:35:07 the port was
+`unable to enumerate USB device`. The chip is a soldered internal device fed from a mainboard
+rail rather than switchable port VBUS, so nothing but a full system power-down re-runs its
+firmware. **This, not the driver, is what every "needs a cold boot" has actually been.**
+
+Windows never resets this device — it aborts the pipe and issues `CLEAR_FEATURE(ENDPOINT_HALT)`.
+That is the whole reason Windows needs no reboots. Escalation ladder, and never go past step 2:
+
+1. `authorized` 0/1 toggle (cvchan does this itself on a `0x23` timeout)
+2. `clear_halt` on `0x01` / `0x81` / `0x85` (`cvrecover`)
+3. *nothing* — a wedged-but-enumerating chip recovers on its own; a reset one never does. The tools here defend against it two ways: they install SIGTERM/SIGINT/SIGHUP handlers that
 cancel the capture and close the session before exiting (so a cancelled prompt or a suspend can't
 wedge it), and on startup they detect a light wedge (`0x23` timeout) and auto-recover with the
 `authorized` toggle before retrying. Only an uncatchable `kill -9` mid-capture, or the rare deep

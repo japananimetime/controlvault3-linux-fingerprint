@@ -497,6 +497,7 @@ int main(int argc, char **argv){
     close_handle(handle);
 
 done:
-    libusb_release_interface(h,0); libusb_close(h); libusb_exit(ctx);
+    if(h){ libusb_release_interface(h,0); libusb_close(h); }   // h is NULL when the device never opened
+    libusb_exit(ctx);
     return 0;
 }
