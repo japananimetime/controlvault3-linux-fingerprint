@@ -294,7 +294,8 @@ int main(int argc, char **argv){
         for(int t=0;t<25 && !h;t++){ h=libusb_open_device_with_vid_pid(ctx,VID,PID); if(!h) napms(200); }
         if(!h) continue;
         if(libusb_kernel_driver_active(h,0)==1) libusb_detach_kernel_driver(h,0);
-        if(libusb_claim_interface(h,0)){ libusb_close(h); h=NULL; continue; }
+        int claimed=0; for(int t=0;t<12 && !claimed;t++){ if(libusb_claim_interface(h,0)==0) claimed=1; else napms(250); }
+        if(!claimed){ libusb_close(h); h=NULL; break; }
         unsigned char clientNonce[20]; RAND_bytes(clientNonce, 20);
         unsigned char f23[68]; hdr(f23, 0x23, 0x41, 0x00, 0, 68);
         put32(f23+40, 24); memcpy(f23+44, clientNonce, 20); put32(f23+64, 1);
@@ -347,7 +348,7 @@ int main(int argc, char **argv){
       if(pl>0) hexdump("  reply         ", pt, pl>32?32:pl); }
     wrap_seq = 1;  // 0x02 consumed seq 0
 
-    if(argc>2 && strcmp(argv[2],"verify")==0){
+    if(argc>1 && strcmp(argv[1],"verify")==0){
         printf("\n=== verify: touch the enrolled finger ===\n");
         // 0x66 capture (wrapped) -> async 0x03 -> 0x73 match
         unsigned char t66[36] = {
@@ -401,7 +402,7 @@ int main(int argc, char **argv){
       if(cd!=0x0F && cd>=0) wrap_seq++;
       printf("  (discard CV 0x%02X)\n", cd);
     }
-    if(argc>2 && strcmp(argv[2],"reset")==0){
+    if(argc>1 && strcmp(argv[1],"reset")==0){
         printf("\n(reset mode: state cleared, exiting)\n");
         cancel_pending(); close_handle(handle); goto done;
     }

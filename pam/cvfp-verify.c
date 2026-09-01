@@ -146,7 +146,9 @@ int main(int argc,char**argv){
         for(int t=0;t<25 && !h;t++){ h=libusb_open_device_with_vid_pid(ctx,VID,PID); if(!h) napms(200); }
         if(!h) continue;
         if(libusb_kernel_driver_active(h,0)==1) libusb_detach_kernel_driver(h,0);
-        if(libusb_claim_interface(h,0)){ libusb_close(h); h=NULL; continue; }
+        // claim with retry: the device may be transiently held (e.g. a lock-screen watcher between polls)
+        int claimed=0; for(int t=0;t<12 && !claimed && !g_sig;t++){ if(libusb_claim_interface(h,0)==0) claimed=1; else napms(250); }
+        if(!claimed){ libusb_close(h); h=NULL; break; }   // still busy: fall through to password, don't disturb the holder
         unsigned char cn[20]; RAND_bytes(cn,20);
         unsigned char f23[68]; hdr(f23,0x23,0x41,0,0,68); put32(f23+40,24); memcpy(f23+44,cn,20); put32(f23+64,1);
         int out_ms = (attempt==0) ? 2500 : 5000;   // detect a wedge fast on the first try
