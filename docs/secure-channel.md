@@ -111,5 +111,8 @@ a wrong-finger test returning `0`.
 An interrupted session (a killed process leaving a capture armed) wedges the command interface
 (`0x23` bulk-OUT timeout, USB still enumerated). Gentle fix:
 `echo 0 > /sys/bus/usb/devices/<dev>/authorized; sleep 2; echo 1 > .../authorized`. Do **not** use
-the port `disable` knob — it can cause an unrecoverable `error -110` needing a reboot. Well-behaved
-tools cancel the capture and close the session on exit, and never get force-killed.
+the port `disable` knob — it can cause an unrecoverable `error -110` needing a reboot. The tools here defend against it two ways: they install SIGTERM/SIGINT/SIGHUP handlers that
+cancel the capture and close the session before exiting (so a cancelled prompt or a suspend can't
+wedge it), and on startup they detect a light wedge (`0x23` timeout) and auto-recover with the
+`authorized` toggle before retrying. Only an uncatchable `kill -9` mid-capture, or the rare deep
+wedge, still needs the manual reboot.

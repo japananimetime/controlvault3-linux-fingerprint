@@ -26,6 +26,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
+#include <time.h>
+#include <dirent.h>
+#include <strings.h>
 #include <libusb-1.0/libusb.h>
 #include <openssl/ec.h>
 #include <openssl/ecdh.h>
@@ -255,24 +259,48 @@ static int find_param_pt(const unsigned char *pt, int ptlen, int want, unsigned 
 
 // ---- main ---------------------------------------------------------------------------------
 
+
+// --- robustness: signal-driven clean teardown + light-wedge auto-recovery -------------------
+static volatile sig_atomic_t g_sig = 0;
+static void on_sig(int s){ (void)s; g_sig = 1; }
+static void napms(long ms){ struct timespec t={ms/1000,(ms%1000)*1000000L}; nanosleep(&t,0); }
+static int rd_id(const char*base,const char*leaf,char*o,int n){ char p[600]; snprintf(p,sizeof p,"%s/%s",base,leaf); FILE*fp=fopen(p,"r"); if(!fp)return -1; int r=fread(o,1,n-1,fp); fclose(fp); if(r<=0)return -1; o[r]=0; o[strcspn(o,"\n")]=0; return 0; }
+static void recover_device(void){   // toggle USB `authorized` to clear a light wedge (needs root)
+    DIR*d=opendir("/sys/bus/usb/devices"); if(!d) return; struct dirent*e; char base[600]={0};
+    while((e=readdir(d))){ if(e->d_name[0]=='.')continue; char b[600],v[16],p[16];
+        snprintf(b,sizeof b,"/sys/bus/usb/devices/%s",e->d_name);
+        if(rd_id(b,"idVendor",v,16)||rd_id(b,"idProduct",p,16))continue;
+        if(!strcasecmp(v,"0a5c")&&!strcasecmp(p,"5843")){ snprintf(base,sizeof base,"%s",b); break; } }
+    closedir(d); if(!base[0]) return;
+    char ap[640]; snprintf(ap,sizeof ap,"%s/authorized",base);
+    FILE*fp=fopen(ap,"w"); if(fp){ fputs("0",fp); fclose(fp); } napms(2000);
+    fp=fopen(ap,"w"); if(fp){ fputs("1",fp); fclose(fp); } napms(3000);
+}
+
 int main(int argc, char **argv){
     if(gen_host_key()){ fprintf(stderr, "key generation failed\n"); return 1; }
 
+    struct sigaction sa; memset(&sa,0,sizeof sa); sa.sa_handler=on_sig;
+    sigaction(SIGTERM,&sa,0); sigaction(SIGINT,&sa,0); sigaction(SIGHUP,&sa,0);
+
     libusb_context *ctx=0;
     if(libusb_init(&ctx)){ fprintf(stderr,"libusb_init failed\n"); return 1; }
-    h=libusb_open_device_with_vid_pid(ctx, VID, PID);
-    if(!h){ fprintf(stderr,"device not found (fprintd holding it?)\n"); return 1; }
-    if(libusb_kernel_driver_active(h,0)==1) libusb_detach_kernel_driver(h,0);
-    if(libusb_claim_interface(h,0)){ fprintf(stderr,"claim_interface failed\n"); return 1; }
 
-    // --- 0x23 challenge: sessionless, plaintext, 20-byte client nonce -----------------------
-    unsigned char clientNonce[20]; RAND_bytes(clientNonce, 20);
-    unsigned char f23[68]; hdr(f23, 0x23, 0x41, 0x00, 0, 68);
-    put32(f23+40, 24);                       // param len = 24
-    memcpy(f23+44, clientNonce, 20);
-    put32(f23+64, 1);
+    // Open + 0x23 handshake, auto-recovering a light wedge once.
     printf("=== handshake ===\n");
-    if(xfer(f23, 68, "0x23 challenge") != 0){ printf("  0x23 rejected\n"); goto done; }
+    int hs_ok=0;
+    for(int attempt=0; attempt<2 && !hs_ok && !g_sig; attempt++){
+        if(attempt>0){ if(h){ libusb_release_interface(h,0); libusb_close(h); h=NULL; } printf("  sensor wedged — recovering...\n"); recover_device(); }
+        for(int t=0;t<25 && !h;t++){ h=libusb_open_device_with_vid_pid(ctx,VID,PID); if(!h) napms(200); }
+        if(!h) continue;
+        if(libusb_kernel_driver_active(h,0)==1) libusb_detach_kernel_driver(h,0);
+        if(libusb_claim_interface(h,0)){ libusb_close(h); h=NULL; continue; }
+        unsigned char clientNonce[20]; RAND_bytes(clientNonce, 20);
+        unsigned char f23[68]; hdr(f23, 0x23, 0x41, 0x00, 0, 68);
+        put32(f23+40, 24); memcpy(f23+44, clientNonce, 20); put32(f23+64, 1);
+        if(xfer(f23, 68, "0x23 challenge") == 0) hs_ok=1;
+    }
+    if(!hs_ok){ printf("  0x23 rejected (sensor unavailable)\n"); goto done; }
 
     unsigned handle = get32(rb+16);
     unsigned char devicePub[64], deviceNonce[20];
@@ -384,7 +412,7 @@ int main(int argc, char **argv){
     unsigned char commit_id[20]; int have_commit_id=0;
     const int NEED = 16;   // Windows collects ~16 samples before commit
     int accepted=0, done_flag=0;
-    for(int spl=0; spl<30 && !done_flag; spl++){
+    for(int spl=0; spl<30 && !done_flag && !g_sig; spl++){
         // 0x66 capture (wrapped, TLV 36)
         unsigned char t66[36] = {
             0,0,0,0, 4,0,0,0, 0,0,0,0, 0,0,0,0, 4,0,0,0, 1,0,0,0, 0,0,0,0, 4,0,0,0, 0x23,0,0,0 };

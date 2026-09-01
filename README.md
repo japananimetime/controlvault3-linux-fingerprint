@@ -66,9 +66,11 @@ windows/       appendix: how it was discovered (NOT needed to use it)
 - **Physical-access security model.** The chip encrypts the channel but doesn't authenticate the
   host — like most internal readers, its security is "you have the laptop open." Don't expect it to
   resist someone with root or physical USB access.
-- **The sensor can wedge** if a tool is killed mid-capture (`0x23` timeout). Recovery is a gentle
-  USB `authorized` toggle; see [docs/secure-channel.md](docs/secure-channel.md). The tools clean up
-  on exit to avoid it.
+- **The sensor can wedge** if a process is killed mid-capture. The tools defend against this:
+  SIGTERM/SIGINT/SIGHUP handlers cancel the capture and close the session before exiting, and a
+  light wedge is auto-recovered (USB `authorized` toggle) on the next run. Only a `kill -9`
+  mid-capture, or the rare deep wedge, needs a manual reboot — see
+  [docs/secure-channel.md](docs/secure-channel.md).
 - One device family tested. **Try it, report back**, and please don't publish anyone's keys.
 
 ## Help wanted
