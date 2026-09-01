@@ -18,6 +18,12 @@ Validated end to end on a Dell Latitude 5531: `fprintd-enroll` completes 12 stag
 `fprintd-verify` reports `verify-match`, `sudo` authenticates through `pam_fprintd`, and the
 device is left healthy.
 
+> **Last validated:** 2026-09-01 — `libfprint-tod` 1.94.8+tod1, `fprintd` 1.94.5, CachyOS,
+> kernel 7.2.2, Dell Latitude 5531 (`0a5c:5843`).
+> If you are reading this much later, re-check before trusting it: the driver links against
+> versioned symbols in `libfprint-2-tod`, so a libfprint ABI bump is exactly the kind of change
+> that breaks it quietly (see [driver/README.md](driver/README.md)).
+
 **How the protocol (see `docs/secure-channel.md`) maps to `FpiDeviceClass`:**
 | vfunc | sequence | status |
 |---|---|---|
