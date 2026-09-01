@@ -129,6 +129,141 @@ fail:
   return FALSE;
 }
 
+
+/* --- decrypt a wrapped reply; find a TLV value of a given size ------------------------------- */
+static int cvfp_unwrap (FpiDeviceCvfp *self, guint8 *pt){
+  if (self->rlen < 44+16) return -1; int cl = self->rlen - 44; if (cl % 16) return -1;
+  return cvfp_aes (self, 0, self->rb+24, self->rb+44, cl, pt);
+}
+static gboolean cvfp_find_param (const guint8 *pt, int pl, int want, guint8 *out){
+  for (int i=0; i+8+want <= pl; i+=4)
+    if (g32(pt+i) <= 3 && g32(pt+i+4) == (guint32)want) { memcpy (out, pt+i+8, want); return TRUE; }
+  return FALSE;
+}
+/* send an UNWRAPPED session command (0x8A, 0x04, 0x68) */
+static int cvfp_send_plain (FpDevice *dev, guint cmd, guint attr, const guint8 *tlv, int tlvlen, guint32 handle){
+  guint8 f[128]; int total = 44+tlvlen; cvfp_hdr (f,cmd,attr,0x00,handle,total); p32 (f+40,tlvlen);
+  if (tlv && tlvlen) memcpy (f+44,tlv,tlvlen); return cvfp_xfer (dev,f,total,5000,60000);
+}
+/* wait for the async "finger read" event (interrupt status 0x03) */
+static int cvfp_wait_finger (FpDevice *dev, guint timeout_ms){
+  FpiDeviceCvfp *self = FPI_DEVICE_CVFP (dev); (void)self;
+  g_autoptr(GError) e=NULL; g_autoptr(FpiUsbTransfer) t = fpi_usb_transfer_new (dev);
+  fpi_usb_transfer_fill_interrupt (t, EP_INT, 32);
+  if (!fpi_usb_transfer_submit_sync (t, timeout_ms, &e)) return -1;
+  return (t->actual_length >= 4) ? (int) g32 (t->buffer) : -1;
+}
+static void cvfp_cancel_capture (FpDevice *dev, guint32 handle){
+  guint8 t[12] = {0,0,0,0,4,0,0,0,0,0,0,0}; p32 (t+8,handle); cvfp_send_plain (dev,0x68,0x44,t,12,0);
+}
+static void set_print_id (FpPrint *print, const guint8 *id20){
+  fpi_print_set_type (print, FPI_PRINT_RAW);
+  fpi_print_set_device_stored (print, TRUE);
+  GVariant *v = g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, id20, 20, 1);
+  g_object_set (print, "fpi-data", v, NULL);
+}
+static gboolean get_print_id (FpPrint *print, guint8 *id20){
+  g_autoptr(GVariant) v = NULL; g_object_get (print, "fpi-data", &v, NULL);
+  if (!v) return FALSE; gsize n=0; const guint8 *d = g_variant_get_fixed_array (v, &n, 1);
+  if (n != 20) return FALSE; memcpy (id20, d, 20); return TRUE;
+}
+
+/* --- capture one finger and run the match (0x73); return match id + flag --------------------- */
+static gboolean cvfp_capture_and_match (FpDevice *dev, guint8 out_id[20], gboolean *matched, GError **error){
+  FpiDeviceCvfp *self = FPI_DEVICE_CVFP (dev);
+  guint8 t66[36] = {0,0,0,0,4,0,0,0,0,0,0,0,0,0,0,0,4,0,0,0,1,0,0,0,0,0,0,0,4,0,0,0,0x23,0,0,0};
+  p32 (t66+8, self->handle);
+  guint8 f66[256]; int n66 = cvfp_build_wrapped (self,f66,0x66,0x47,self->handle,t66,36,80,self->wrap_seq);
+  int c = cvfp_xfer (dev,f66,n66,5000,60000);
+  if (c == 0x85) { cvfp_cancel_capture (dev,self->handle); c = cvfp_xfer (dev,f66,n66,5000,60000); }
+  if (c != 0) { g_set_error (error,FP_DEVICE_ERROR,FP_DEVICE_ERROR_PROTO,"cvfp: 0x66 %d",c); return FALSE; }
+  self->wrap_seq++;
+  int ev = cvfp_wait_finger (dev, 30000);
+  if (ev != 0x03) { cvfp_cancel_capture (dev,self->handle); g_set_error (error,FP_DEVICE_ERROR,FP_DEVICE_ERROR_PROTO,"cvfp: no finger"); return FALSE; }
+  guint8 t73[68] = {0,0,0,0,4,0,0,0,0,0,0,0, 0,0,0,0,4,0,0,0,0x48,0x01,0,0,
+      0,0,0,0,4,0,0,0,0xe2,0x53,0,0, 0,0,0,0,4,0,0,0,0,0,0,0,
+      2,0,0,0,4,0,0,0,0xd3,0x0a,0x7b,0, 3,0,0,0,0x14,0,0,0};
+  p32 (t73+8, self->handle);
+  guint8 f73[256]; int n73 = cvfp_build_wrapped (self,f73,0x73,0x47,self->handle,t73,68,112,self->wrap_seq);
+  c = cvfp_xfer (dev,f73,n73,5000,60000); self->wrap_seq++;
+  if (c != 0) { g_set_error (error,FP_DEVICE_ERROR,FP_DEVICE_ERROR_PROTO,"cvfp: 0x73 %d",c); return FALSE; }
+  guint8 pt[512]; int pl = cvfp_unwrap (self, pt);
+  *matched = (pl >= 12 && g32 (pt+8) == 1);
+  if (*matched && pl >= 52) memcpy (out_id, pt+32, 20); else memset (out_id, 0, 20);
+  return TRUE;
+}
+
+static void dev_verify (FpDevice *dev){
+  FpPrint *print = NULL; fpi_device_get_verify_data (dev, &print);
+  guint8 want[20], got[20]; gboolean matched = FALSE; g_autoptr(GError) e = NULL;
+  if (!cvfp_capture_and_match (dev, got, &matched, &e)) { fpi_device_verify_complete (dev, g_steal_pointer (&e)); return; }
+  gboolean same = matched && get_print_id (print, want) && memcmp (want, got, 20) == 0;
+  fpi_device_verify_report (dev, same ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL, print, NULL);
+  fpi_device_verify_complete (dev, NULL);
+}
+static void dev_identify (FpDevice *dev){
+  GPtrArray *prints = NULL; fpi_device_get_identify_data (dev, &prints);
+  guint8 got[20]; gboolean matched = FALSE; g_autoptr(GError) e = NULL;
+  if (!cvfp_capture_and_match (dev, got, &matched, &e)) { fpi_device_identify_complete (dev, g_steal_pointer (&e)); return; }
+  FpPrint *hit = NULL;
+  if (matched) for (guint i=0; prints && i<prints->len; i++){ FpPrint *p = g_ptr_array_index (prints,i); guint8 id[20];
+    if (get_print_id (p,id) && memcmp (id,got,20)==0) { hit = p; break; } }
+  fpi_device_identify_report (dev, hit, hit, NULL);
+  fpi_device_identify_complete (dev, NULL);
+}
+
+static void dev_enroll (FpDevice *dev){
+  FpiDeviceCvfp *self = FPI_DEVICE_CVFP (dev);
+  FpPrint *print = NULL; fpi_device_get_enroll_data (dev, &print);
+  g_autoptr(GError) e = NULL;
+  /* discard any pending, then start */
+  { guint8 t[12]={0,0,0,0,4,0,0,0,0,0,0,0}; p32(t+8,self->handle);
+    guint8 f[128]; int n=cvfp_build_wrapped(self,f,0x6D,0x45,self->handle,t,12,48,self->wrap_seq);
+    if (cvfp_xfer(dev,f,n,5000,60000)==0) self->wrap_seq++; }
+  { guint8 t[12]={0,0,0,0,4,0,0,0,0,0,0,0}; cvfp_send_plain(dev,0x8A,0x44,t,12,0); }
+
+  int accepted = 0; guint8 last_id[20]; memset(last_id,0,20); gboolean done = FALSE;
+  for (int spl=0; spl<30 && !done; spl++){
+    guint8 t66[36]={0,0,0,0,4,0,0,0,0,0,0,0,0,0,0,0,4,0,0,0,1,0,0,0,0,0,0,0,4,0,0,0,0x23,0,0,0};
+    p32(t66+8,self->handle);
+    guint8 f66[256]; int n66=cvfp_build_wrapped(self,f66,0x66,0x47,self->handle,t66,36,80,self->wrap_seq);
+    int c=cvfp_xfer(dev,f66,n66,5000,60000);
+    if (c==0x85){ cvfp_cancel_capture(dev,self->handle); c=cvfp_xfer(dev,f66,n66,5000,60000); }
+    if (c!=0){ if(c<0) break; continue; }
+    self->wrap_seq++;
+    guint8 rpt[512]; int rpl=cvfp_unwrap(self,rpt); guint8 hash[20];
+    if (rpl<=0 || !cvfp_find_param(rpt,rpl,20,hash)){ continue; }
+    if (cvfp_wait_finger(dev,30000)!=0x03) break;
+    guint8 t6c[48]={0,0,0,0,4,0,0,0,0,0,0,0,0,0,0,0,0x14,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,0,0,0,0,0,0,0};
+    p32(t6c+8,self->handle); memcpy(t6c+20,hash,20);
+    guint8 f6c[256]; int n6c=cvfp_build_wrapped(self,f6c,0x6C,0x45,self->handle,t6c,48,80,self->wrap_seq);
+    c=cvfp_xfer(dev,f6c,n6c,5000,60000); if (c!=0x0F && c>=0) self->wrap_seq++;
+    if (c==0 || c==0x8F){ accepted++;
+      guint8 crpt[512]; int crpl=cvfp_unwrap(self,crpt); guint8 rid[20];
+      memcpy(last_id,hash,20);
+      fpi_device_enroll_progress (dev, accepted, print, NULL);
+      if (cvfp_find_param(crpt,crpl,20,rid) && memcmp(rid,hash,20)!=0){ memcpy(last_id,rid,20); done=TRUE; }
+    } else if (c==0x8C){ break; }
+    else if (c<0) break;
+  }
+  if (!done){ g_set_error(&e,FP_DEVICE_ERROR,FP_DEVICE_ERROR_GENERAL,"cvfp: enrollment did not complete"); fpi_device_enroll_complete(dev,NULL,g_steal_pointer(&e)); return; }
+  /* commit with the device template id */
+  guint8 t6e[64]={0,0,0,0,4,0,0,0,0,0,0,0,0,0,0,0,0x14,0,0,0,
+      0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,0,0,0,0,0,0,0,2,0,0,0,0,0,0,0,3,0,0,0,0,0,0,0};
+  p32(t6e+8,self->handle); memcpy(t6e+20,last_id,20);
+  guint8 f6e[256]; int n6e=cvfp_build_wrapped(self,f6e,0x6E,0x45,self->handle,t6e,64,96,self->wrap_seq);
+  int c=cvfp_xfer(dev,f6e,n6e,5000,60000); self->wrap_seq++;
+  if (c!=0){ g_set_error(&e,FP_DEVICE_ERROR,FP_DEVICE_ERROR_GENERAL,"cvfp: commit %d",c); fpi_device_enroll_complete(dev,NULL,g_steal_pointer(&e)); return; }
+  set_print_id (print, last_id);
+  fpi_device_enroll_complete (dev, g_object_ref (print), NULL);
+}
+
+/* storage: minimal (fprintd stores print metadata on disk; list used for reconcile) */
+static void dev_list (FpDevice *dev){ fpi_device_list_complete (dev, g_ptr_array_new_with_free_func (g_object_unref), NULL); }
+static void dev_delete (FpDevice *dev){ fpi_device_delete_complete (dev, NULL); }
+static void dev_clear_storage (FpDevice *dev){ fpi_device_clear_storage_complete (dev, NULL); }
+
 /* --- FpiDeviceClass vfuncs ------------------------------------------------------------------- */
 static void dev_probe (FpDevice *dev){
   fpi_device_probe_complete (dev, NULL, "Dell ControlVault 3 (cvfp)", NULL);
@@ -139,13 +274,24 @@ static void dev_open (FpDevice *dev){
   g_autoptr(GError) err = NULL;
   if (!g_usb_device_claim_interface (usb, 0, 0, &err)) { fpi_device_open_complete (dev, g_steal_pointer (&err)); return; }
   self->wrap_seq = 0;
-  if (!cvfp_gen_key (self)) { g_set_error (&err, FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL, "keygen failed"); fpi_device_open_complete (dev, g_steal_pointer (&err)); return; }
-  if (!cvfp_open_channel (dev, &err)) { fpi_device_open_complete (dev, g_steal_pointer (&err)); return; }
+  if (!cvfp_gen_key (self)) {
+    g_usb_device_release_interface (usb, 0, 0, NULL);
+    g_set_error (&err, FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL, "keygen failed");
+    fpi_device_open_complete (dev, g_steal_pointer (&err)); return;
+  }
+  if (!cvfp_open_channel (dev, &err)) {
+    if (self->host_key) { EC_KEY_free (self->host_key); self->host_key = NULL; }
+    g_usb_device_release_interface (usb, 0, 0, NULL);   /* don't leak the claim on failure */
+    fpi_device_open_complete (dev, g_steal_pointer (&err)); return;
+  }
   fpi_device_open_complete (dev, NULL);
 }
 static void dev_close (FpDevice *dev){
   FpiDeviceCvfp *self = FPI_DEVICE_CVFP (dev);
-  if (self->handle) { guint8 c[56]; cvfp_hdr (c,0x04,0x40,0x04,0,56); p32 (c+40,12); p32 (c+48,4); p32 (c+52,self->handle); cvfp_xfer (dev,c,56,2000,3000); self->handle = 0; }
+  if (self->handle) {
+    cvfp_cancel_capture (dev, self->handle);   /* clear any armed capture so we don't wedge the chip */
+    guint8 c[56]; cvfp_hdr (c,0x04,0x40,0x04,0,56); p32 (c+40,12); p32 (c+48,4); p32 (c+52,self->handle); cvfp_xfer (dev,c,56,2000,3000); self->handle = 0;
+  }
   if (self->host_key) { EC_KEY_free (self->host_key); self->host_key = NULL; }
   GUsbDevice *usb = fpi_device_get_usb_device (dev);
   g_autoptr(GError) err = NULL;
@@ -168,6 +314,12 @@ static void fpi_device_cvfp_class_init (FpiDeviceCvfpClass *klass){
   dc->probe = dev_probe;
   dc->open  = dev_open;
   dc->close = dev_close;
+  dc->enroll = dev_enroll;
+  dc->verify = dev_verify;
+  dc->identify = dev_identify;
+  dc->list = dev_list;
+  dc->delete = dev_delete;
+  dc->clear_storage = dev_clear_storage;
 }
 
 /* TOD entry point: libfprint-tod calls this to obtain the driver's GType. */
