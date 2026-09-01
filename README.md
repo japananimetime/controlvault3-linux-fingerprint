@@ -19,12 +19,54 @@ and verification from scratch, then wires them into PAM so you can **tap to auth
   other CV models / USB IDs may need adjustment. Reports welcome.
 
 ## Quick start
+
+There are **two independent ways** to use this, and you should **pick exactly one**. Both want
+exclusive ownership of the sensor; running them side by side makes them fight over the USB device
+and wedge the chip.
+
+### A — libfprint TOD driver *(recommended)*
+
+Makes the sensor a first-class `fprintd` reader, so `pam_fprintd`, `fprintd-enroll`/`fprintd-verify`
+and the GNOME/KDE fingerprint panels all just work. No custom PAM module, no lock-screen watcher.
+
+```bash
+# deps: a C compiler, openssl (dev headers), libfprint-2-tod-1 (dev)
+cd driver
+gcc -shared -fPIC cvfp-tod.c -o libfprint-2-tod-1-cvfp.so \
+  $(pkg-config --cflags --libs libfprint-2-tod-1) \
+  $(pkg-config --libs glib-2.0 gobject-2.0 gusb) -lcrypto
+
+# take over the slot Dell's non-working driver occupies
+sudo mv /usr/lib/libfprint-2/tod-1/libfprint-2-tod-1-broadcom.so{,.disabled}
+sudo install -Dm755 libfprint-2-tod-1-cvfp.so /usr/lib/libfprint-2/tod-1/
+sudo systemctl restart fprintd
+
+fprintd-enroll        # touch ~12x
+fprintd-verify        # tap once
+```
+
+Then add the standard line to whichever `/etc/pam.d/<service>` you want — `sudo`, your greeter,
+`polkit-1` — above the password include:
+
+```
+auth   sufficient   pam_fprintd.so
+```
+
+> **Build note:** the driver **must be linked against `libfprint-2-tod`** (that is what
+> `pkg-config --libs libfprint-2-tod-1` does), not merely compiled with its `-I` paths. If you only
+> add the include paths it will **segfault the moment any client opens the device**, for a subtle
+> symbol-versioning reason explained in [driver/README.md](driver/README.md).
+
+### B — standalone PAM *(no fprintd)*
+
+The original path. Useful if you don't want `fprintd` at all, or your `libfprint` has no TOD support.
+
 ```bash
 # deps: a C compiler, libusb-1.0, openssl (dev headers)
 sudo systemctl stop fprintd        # it fights for the USB device
 
 # 1) enroll a finger (touch ~12x)
-cd src && gcc -O2 -o cvchan cvchan.c -lusb-1.0 -lcrypto && sudo ./cvchan
+cd tools && gcc -O2 -o cvchan cvchan.c -lusb-1.0 -lcrypto && sudo ./cvchan
 
 # 2) install the PAM authenticator (sudo, polkit, login)
 cd ../pam && sudo ./install.sh
@@ -35,30 +77,37 @@ sudo -k && sudo id                 # -> "Touch the fingerprint sensor"
 
 - **`cvchan`** with no args = enroll; `cvchan verify` = one-shot match; `cvchan reset` = clear a
   stuck enrollment.
+- **`pam/install.sh`** builds the `pam_cvfp.so` module + the `cvfp-verify` helper, masks `fprintd`,
+  and adds a `sufficient` fingerprint line to `sudo`, `login`, and `polkit-1`.
+
+### Either way
+
+- **Password always stays as the fallback** — every PAM line is `sufficient`, so you cannot be
+  locked out by a failed or missing fingerprint.
 - **Enroll deliberately.** Press firmly and fully on each of the ~12 taps and shift the contact
   point slightly between them (center, then a little left/right/up/down). A rushed enroll makes a
   weak template that matches inconsistently; a careful one matches every time.
-- **`pam/install.sh`** builds the `pam_cvfp.so` module + the `cvfp-verify` helper, masks the
-  (non-functional) `fprintd`, and adds a `sufficient` fingerprint line to `sudo`, `login`, and
-  `polkit-1` — **password always stays as the fallback, you can't be locked out.**
 - **Lock screens**: anything PAM-based (swaylock, hyprlock, gtklock, GDM, SDDM…) takes the same
   one-line PAM edit. i3lock-color has no PAM-promptable moment, so use the tap-to-unlock watcher in
-  [integrations/](integrations/README.md).
+  [integrations/](integrations/README.md) (it drives whichever path you chose).
 
 ## What works
-| Surface | Mechanism |
-|---|---|
-| `sudo` | `pam_cvfp.so` (with password fallback) |
-| `polkit` / `pkexec` GUI dialogs | `pam_cvfp.so` |
-| Login greeters / console | `pam_cvfp.so` |
-| PAM-based lock screens | `pam_cvfp.so` |
-| i3lock-color | `integrations/i3lock/cvlock` watcher (tap to unlock) |
+| Surface | Path A (fprintd) | Path B (standalone) |
+|---|---|---|
+| `sudo` | `pam_fprintd.so` | `pam_cvfp.so` |
+| `polkit` / `pkexec` GUI dialogs | `pam_fprintd.so` | `pam_cvfp.so` |
+| Login greeters / console | `pam_fprintd.so` | `pam_cvfp.so` |
+| PAM-based lock screens | `pam_fprintd.so` | `pam_cvfp.so` |
+| GNOME/KDE fingerprint settings | yes | no |
+| i3lock-color | `integrations/i3lock/cvlock` watcher (tap to unlock) | same watcher |
 
 ## Layout
 ```
-src/           core: enroll + verify over the reverse-engineered channel (keyless)
-pam/           the PAM module + setuid verify helper + installer  (universal)
+driver/        the libfprint TOD driver — the main deliverable (path A)
+pam/           standalone PAM module + setuid verify helper      (path B)
 integrations/  optional per-desktop bits (i3lock watcher, notes for others)
+tools/         dev + research tooling, not needed to use either path:
+               cvchan (enroll/verify/reset), cvrecover (clear a stuck endpoint)
 docs/          the protocol reverse-engineering writeup
 windows/       appendix: how it was discovered (NOT needed to use it)
 ```
@@ -71,7 +120,10 @@ windows/       appendix: how it was discovered (NOT needed to use it)
   resist someone with root or physical USB access.
 - **The sensor can wedge** if a process is killed mid-capture. The tools defend against this:
   SIGTERM/SIGINT/SIGHUP handlers cancel the capture and close the session before exiting, and a
-  light wedge is auto-recovered (USB `authorized` toggle) on the next run. Only a `kill -9`
+  light wedge is auto-recovered (USB `authorized` toggle) on the next run. **Never** "recover" it
+  with a USB port reset (`libusb_reset_device`, or the port `disable` knob): that is what turns a
+  recoverable wedge into a chip that will not enumerate at all (`error -110`) until a cold boot —
+  see docs/secure-channel.md#recovery. Only a `kill -9`
   mid-capture, or the rare deep wedge, needs a manual reboot — see
   [docs/secure-channel.md](docs/secure-channel.md).
 - One device family tested. **Try it, report back**, and please don't publish anyone's keys.
@@ -87,4 +139,7 @@ desktop's built-in fingerprint support (no PAM edits, no watcher). Feasibility i
 
 ## License
 MIT (see LICENSE). Interoperability reverse-engineering of your own hardware. Not affiliated with
-Dell or Broadcom; no vendor code is included.
+Dell or Broadcom; no vendor code is included — the protocol constants here are observations of a
+wire format, and nothing needs a key extracted from anywhere.
+
+If this saved you a reinstall and we ever meet, you can buy me a beer. 🍺

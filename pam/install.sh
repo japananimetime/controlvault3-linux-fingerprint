@@ -44,5 +44,5 @@ if [ -f /etc/security/faillock.conf ]; then
   printf 'deny = 6\nunlock_time = 90\n' >> /etc/security/faillock.conf
 fi
 
-echo "installed. enroll a finger:  sudo ../src/cvchan   (touch ~12x)"
+echo "installed. enroll a finger:  sudo ../tools/cvchan   (touch ~12x)"
 echo "then test:  sudo -k && sudo id   /   pkexec id"

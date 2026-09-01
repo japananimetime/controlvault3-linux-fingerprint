@@ -99,7 +99,7 @@ format strings, which embed each function's own name (`"%s: ..."`). Search:
 to confirm the static reading rather than deriving it cold.
 
 ## After you have the key + KDF
-Port the derivation and AES wrap into the Linux harnesses (`src/cvwrap.c` already does the
+Port the derivation and AES wrap into the Linux harnesses (`tools/cvwrap.c` already does the
 handshake). Then a wrapped `0x02` → `0x66` → `0x6C`×N → `0x6E` sequence can be issued from Linux.
 If instead the key turns out user/machine-persisted and you just want it working, the cheaper win
 is an on-Windows helper that drives WBF directly — see the endgames in
