@@ -76,7 +76,11 @@ windows/       appendix: how it was discovered (NOT needed to use it)
   [docs/secure-channel.md](docs/secure-channel.md).
 - One device family tested. **Try it, report back**, and please don't publish anyone's keys.
 
-## Help wanted
+## Roadmap & help wanted
+The headline next step is a **libfprint TOD driver** so this works through `fprintd` and every
+desktop's built-in fingerprint support (no PAM edits, no watcher). Feasibility is confirmed; see
+[ROADMAP.md](ROADMAP.md).
+
 - Confirm/adjust for other ControlVault 3 units and USB IDs.
 - A `udev` rule instead of setuid for device access.
 - Package it (AUR, etc.) now that it's keyless.
