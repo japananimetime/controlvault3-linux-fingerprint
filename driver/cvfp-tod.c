@@ -276,6 +276,26 @@ static void cvfp_release (FpDevice *dev){
   if (usb) g_usb_device_release_interface (usb, 0, 0, NULL);
 }
 
+/* Open-failure teardown. libfprint opens the GUsbDevice in fp_device_open(), but
+   fpi_device_open_complete() does NOT close it again when open completes with an ERROR: the
+   library's only g_usb_device_close() sits in fpi_device_close_complete(), and that path is
+   unreachable after a failed open because is_open stays FALSE, so fp_device_close() refuses.
+   The handle then stays open for the life of the fprintd process and every later Claim fails
+   with "Open failed with error: Device 0a5c:5843 is already open" until fprintd is restarted
+   -- and our fprintd runs --no-timeout, so it never idles out and resets itself either.
+   Confirmed against libfprint-TOD 1.94.8 (installed) and 1.95.1: still unfixed upstream.
+   The dying process announces it as:
+     libusb: warning [libusb_exit] device 3.3 still referenced
+     libusb: warning [libusb_exit] application left some devices open
+   So close it ourselves. ONLY on the failure path: a successful open is closed later by
+   fpi_device_close_complete(), and closing here too would be a double close. */
+static void cvfp_open_fail (FpDevice *dev, GError *error){
+  GUsbDevice *usb = fpi_device_get_usb_device (dev);
+  cvfp_release (dev);                       /* frees the host key, drops interface 0 */
+  if (usb) g_usb_device_close (usb, NULL);  /* the bit libfprint forgets */
+  fpi_device_open_complete (dev, error);
+}
+
 /* --- open: 0x23 challenge -> 0x24 response -> ECDH/KDF -> wrapped 0x02 ------------------------ */
 enum { O_23, O_24, O_02, O_FIN, O_NUM };
 static void open_run (FpiSsm *ssm, FpDevice *dev){
@@ -321,8 +341,7 @@ static void open_run (FpiSsm *ssm, FpDevice *dev){
 static void open_teardown_done (FpiSsm *ssm, FpDevice *dev, GError *td_error){
   FpiDeviceCvfp *self = FPI_DEVICE_CVFP (dev);
   g_clear_error (&td_error);              /* best effort: report the original open failure */
-  cvfp_release (dev);
-  fpi_device_open_complete (dev, g_steal_pointer (&self->open_error));
+  cvfp_open_fail (dev, g_steal_pointer (&self->open_error));
 }
 static void open_done (FpiSsm *ssm, FpDevice *dev, GError *error){
   FpiDeviceCvfp *self = FPI_DEVICE_CVFP (dev);
@@ -338,8 +357,7 @@ static void open_done (FpiSsm *ssm, FpDevice *dev, GError *error){
     cvfp_start_teardown (dev, FALSE, open_teardown_done);
     return;
   }
-  cvfp_release (dev);
-  fpi_device_open_complete (dev, error);
+  cvfp_open_fail (dev, error);
 }
 
 /* --- verify: 0x66 capture -> finger event -> 0x73 match --------------------------------------- */
@@ -520,11 +538,10 @@ static void dev_open (FpDevice *dev){
   FpiDeviceCvfp *self = FPI_DEVICE_CVFP (dev);
   GUsbDevice *usb = fpi_device_get_usb_device (dev);
   g_autoptr(GError) err = NULL;
-  if (!g_usb_device_claim_interface (usb, 0, 0, &err)) { fpi_device_open_complete (dev, g_steal_pointer (&err)); return; }
+  if (!g_usb_device_claim_interface (usb, 0, 0, &err)) { cvfp_open_fail (dev, g_steal_pointer (&err)); return; }
   self->wrap_seq = 0; self->handle = 0;
   if (!cvfp_gen_key (self)) {
-    g_usb_device_release_interface (usb, 0, 0, NULL);
-    fpi_device_open_complete (dev, fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL, "cvfp: keygen failed"));
+    cvfp_open_fail (dev, fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL, "cvfp: keygen failed"));
     return;
   }
   /* Returns immediately; the handshake runs on the main loop and open_done reports the result. */
