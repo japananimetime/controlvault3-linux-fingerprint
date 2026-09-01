@@ -162,6 +162,9 @@ static void fpi_device_cvfp_class_init (FpiDeviceCvfpClass *klass){
   dc->id_table = id_table;
   dc->scan_type = FP_SCAN_TYPE_PRESS;
   dc->nr_enroll_stages = 12;
+  dc->features = FP_DEVICE_FEATURE_VERIFY | FP_DEVICE_FEATURE_IDENTIFY |
+                 FP_DEVICE_FEATURE_STORAGE | FP_DEVICE_FEATURE_STORAGE_LIST |
+                 FP_DEVICE_FEATURE_STORAGE_DELETE | FP_DEVICE_FEATURE_STORAGE_CLEAR;
   dc->probe = dev_probe;
   dc->open  = dev_open;
   dc->close = dev_close;
