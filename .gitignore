@@ -3,3 +3,4 @@ src/cvchan
 pam/cvfp-verify
 pam/pam_cvfp.so
 *.o
+driver/*.so
