@@ -6,7 +6,7 @@ stock `libfprint-2-tod1-broadcom` driver never opens this channel, which is why 
 failed with `libfprint`.
 
 ## Why the stock driver fails
-Every fingerprint command that matters (`0x6C update`, `0x6E commit`, `0x73 match`) must be sent
+Every fingerprint command that matters (`0x6C update`, `0x6E commit`, `0x2F identify`) must be sent
 **inside an encrypted, per-session channel**. The Linux TOD driver sends them in the clear, so the
 chip rejects them (`0x8C`/`0x8E`). Windows negotiates the channel with two handshake commands
 (`0x23`/`0x24`) that appear in **none** of the Linux driver's traffic.
@@ -82,8 +82,24 @@ The reply is wrapped the same way (no MAC), IV at `+24`, ciphertext = everything
 | `0x66` | `0x47` | wrapped | arm capture (reply carries a 20-byte capture hash) |
 | `0x6C` | `0x45` | wrapped | update enrollment (submit a sample) |
 | `0x6E` | `0x45` | wrapped | commit enrollment |
-| `0x73` | `0x47` | wrapped | match (verify) |
+| `0x2F` | `0x47` | wrapped | identify / match (carries a u32 template handle) |
+| `0x73` | `0x47` | wrapped | legacy hash match — refused with status 89 on current firmware |
 | `0x04` / `0x68` | `0x44` | plain | close session / cancel capture |
+
+## The host-timestamp interrupt (type 5)
+The sensor can request the host clock at any time — mid-exchange or while waiting for a finger —
+and until it is answered the chip stalls everything else. The answer is a vendor control
+transfer: `bmRequestType 0x40` (host-to-device, vendor, device), `bRequest 0x0d`,
+`wValue`/`wIndex` = the packed timestamp, no data stage. Unsolicited clock syncs are refused, so
+only answer when the chip asks.
+
+The packed u32 timestamp, least-significant bits first:
+`day:5 | month:4 | (year-2000):6 | hour:5 | min:6 | sec:6` — one second is `1 << 26`.
+
+Timing matters as much as format. Answer at the moment of the event; answers deferred past it
+are followed by total chip silence. When a deferred answer must precede a new command, the
+control write completes before that command's bulk OUT is submitted — answering and sending in
+the same instant leaves the chip deaf to both.
 
 ## Enrollment
 ```
@@ -99,13 +115,28 @@ completion:               after ~11-12 samples the 0x6C reply returns a NEW 20-b
 Do **not** over-collect past the completion signal — further `0x6C` returns `0x8C` and corrupts the
 enrollment. A stuck enrollment is cleared with `0x6D discard`.
 
+**Event-only completion:** current firmware can end the sample loop by signalling event `0x05`
+("template updated") instead of answering the final `0x6C`: the reply announcement never comes,
+but the chip consumed the command and its wrapped-sequence counter advanced. Keep the counter in
+sync, answer any deferred clock request, and open a listener-only interrupt window for the
+deferred finalize reply — the enrolment id needed for the commit is only announced there. If
+nothing arrives in the window, commit with the accumulated id. Only a commit carrying the
+enrolment id is accepted; a commit carrying the sample-hash fallback id is refused (`0x8E`), and
+that refusal also releases the chip's "finalize pending" state.
+
 ## Verify
 ```
-0x02 open  →  0x66 capture  →  wait 0x03  →  0x73 match
+0x02 open  →  0x66 capture  →  wait 0x03  →  0x2F identify (bound template handle)
 ```
-The `0x73` reply decrypts to a verdict: word at plaintext `+8` is `1` = match (with the matched
-20-byte template id at `+32`), `0` = no match. A genuine on-device biometric comparison; proven by
-a wrong-finger test returning `0`.
+The request is `0x2F` (attr `0x47`) with TLV
+`(0,4,session handle) (0,4,0x48) (0,4,0x53e2) (0,4,0) (2,4,<template handle>)`, template length
+60. The `<template handle>` is the u32 id from the `0x6E` commit reply, bound into the stored
+print at enroll time; a handle-0 request is an invalid bind. The older hash form (`0x73`) is
+refused with status `89` on current firmware.
+
+The reply decrypts to a verdict: word at plaintext `+8` is `1` = match, `0` = no match, with the
+matched u32 template handle at `+20` (plus a 32-byte token). A genuine on-device biometric
+comparison; proven by a wrong-finger test returning `0`.
 
 ## Recovery
 An interrupted session (a killed process leaving a capture armed) wedges the command interface

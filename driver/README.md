@@ -1,14 +1,16 @@
-# libfprint TOD driver (v2, in progress)
+# libfprint TOD driver
 
 A native `libfprint` TOD driver for the ControlVault 3 sensor, so `fprintd` + the GNOME/KDE
 fingerprint settings + `pam_fprintd` drive it directly — no `pam_cvfp` line, no `cvlock` watcher.
 Drop-in replacement for the stock (non-working) `libfprint-2-tod-1-broadcom.so`.
 
-**Status:** milestone 1 **confirmed on hardware** — `probe` + `open` (keyless ECDH handshake +
-channel) + `close` run inside `libfprint`/`fprintd`'s async stack (`libfprint sees 1 device …
-driver=cvfp … cvfp: secure channel open … OPEN OK`). The async integration — the one real
-unknown — works. Next: `verify`/`identify`, then `enroll`, then `list`/`delete`/`clear_storage`,
-each mapping the sequences in ../docs/secure-channel.md to the vfuncs the same way.
+**Status: working end to end on hardware.** `probe`, `open` (keyless ECDH handshake + channel),
+`enroll`, `verify` and `close` all run inside `libfprint`/`fprintd`'s async stack:
+`fprintd-enroll` completes and commits its enrollment, and `fprintd-verify` returns
+`verify-match` for an enrolled finger and `verify-no-match` for a different one. The chip's two
+stall traps — the host-timestamp interrupt and event-only completions (both documented in
+../docs/secure-channel.md) — are handled inside the driver. `list`/`delete`/`clear_storage`
+template management is future work.
 See [../docs/secure-channel.md](../docs/secure-channel.md) and [../ROADMAP.md](../ROADMAP.md).
 
 ## Build
