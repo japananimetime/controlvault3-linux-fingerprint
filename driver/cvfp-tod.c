@@ -4,6 +4,18 @@
  * ECDH-P256 handshake, AES-128-CBC wrapping, enroll/verify. Drop-in replacement for the stock
  * (non-working) libfprint-2-tod-1-broadcom.so.
  *
+ * Templates are device-managed: enroll commits (0x6E) and binds the sensor template
+ * handle from the commit reply into the stored print; verify (0x2F, attr 0x47) carries that u32
+ * handle and accepts the verdict only when the matched handle equals the bound one (id binding).
+ * The sensor's host-timestamp request (interrupt type 5) is answered with a 0x40/0x0d control
+ * transfer below the SSM layer; an unanswered clock stalls the chip completely.
+ *
+ * The verify 0x2F's reply announcement can be REPLACED by a type-5
+ * clock request — the chip consumed the command and wants the clock answered first; the match
+ * path answers at the instant of the event and harvests the deferred reply in a listener-only
+ * window (V_MATCH_REPLY), mirroring the proven enroll-finalize pattern; deferred clock flushes
+ * before the next command are sequential (clock-then-out), never racing the command frame.
+ *
  * Fully asynchronous. Every USB transfer goes through fpi_usb_transfer_submit and each device
  * operation (open / enroll / verify / close) is driven by an fpi_ssm state machine, so the glib
  * main loop is never blocked: fprintd's Claim/EnrollStart/VerifyStart D-Bus calls return
@@ -17,6 +29,7 @@
 #include <openssl/hmac.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+#include <time.h>
 
 #define NR_ENROLL_STAGES 12
 #define MAX_ENROLL_SAMPLES 30
@@ -31,6 +44,8 @@
 #define TO_INTR   60000
 #define TO_FINGER 30000
 #define TO_TEARDOWN 3000
+#define TO_DRAIN   5000   /* best-effort drain of a reply the chip owes without an announcement */
+#define TO_LSN    3000   /* listener-only window after the deferred clock answer: the enroll finalize reply AND the verify match reply (ms) */
 
 struct _FpiDeviceCvfp {
   FpDevice      parent;
@@ -57,8 +72,15 @@ struct _FpiDeviceCvfp {
   int           e_spl;
   int           e_accepted;
   gboolean      e_done;
+  guint32       e_complete;    /* non-zero when the chip signalled enroll completion (id or 0x05 event) */
+  gboolean      e_dead_sess;   /* chip answered 0x05-to-0x6D with a dead session; teardown can only give up */
+  guint32       print_handle;  /* sensor template handle bound at commit (the 0x6E reply id) */
+  gboolean      print_bound;   /* TRUE once a verify run binds against the print's sensor handle */
   guint8        e_hash[20];
   guint8        e_lastid[20];
+  gboolean      e_announce_pending; /* the final stage completed event-only; listen for the deferred finalize reply before committing */
+  gboolean      pending_clock; /* a type-5 clock request arrived mid-exchange; answered at the event (match path) or flushed sequentially before the next command */
+  int           commit_tries;  /* how many 0x6E commits this session has sent (0x8E-restart guard) */
 
   GError       *open_error;   /* carried across the open-failure teardown ssm */
 };
@@ -132,10 +154,62 @@ static gboolean cvfp_find_param (const guint8 *pt, int pl, int want, guint8 *out
   return FALSE;
 }
 
+static void dump_bytes (const char *tag, gsize actual, const guint8 *p, gsize buf){
+  GString *s = g_string_new ("");
+  for (gsize i = 0; i < actual && i < 40 && i < buf; i++)
+    g_string_append_printf (s, " %02x", p[i]);
+  fp_dbg ("cvfp: %s: len=%u [%s ]", tag, (guint) actual, s->str);
+  g_string_free (s, TRUE);
+}
+/* --- the host-timestamp clock (interrupt type 5) ----------------------------------------------- */
+/* The sensor may deliver interrupt type 5 = CV_GET_HOST_TIMESTAMP_INTERRUPT at any time, including
+ * inside a pending command exchange or a finger wait. The host must answer it with a vendor
+ * control transfer (0x40 / 0x0d, wValue/wIndex = packed timestamp, no data stage); until it does,
+ * the chip stalls everything else. Measured on this chip 2026-10-29 by cv3-tod: an unsolicited
+ * clock sync is also refused, so we only answer when the chip asks. Packed u32 bit layout:
+ * day 0..4 | month 5..8 | year-2000 9..14 | hour 15..19 | minute 20..25 | second 26..31.
+ * The answer is an ASYNC fill_control transfer (this GUsb takes enum request-type/recipient,
+ * not a raw bmRequestType byte - 0x40 in that slot produced a garbage setup packet and a STALL
+ * that stalled the drain, the 0x6E commit and even the teardown). Mid-exchange
+ * requests (tsc_int_cb) set pending_clock, and cvfp_transceive flushes it before the next
+ * request frame - answer-after-reply, matching the Windows driver's demux order. That
+ * flush is SEQUENTIAL (the control write completes, only then is the next command's OUT
+ * submitted - answering the clock and sending the 0x68 teardown OUT in the same
+ * instant leaves the chip deaf to both), and the verify match path answers at the INSTANT
+ * of the event instead of deferring (every answer given at the moment of the event
+ * landed; later answers were followed by total chip silence). Only the finger
+ * wait answers inline: there is no reply the chip owes while it waits for a finger. */
+static void clock_sync_done (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err){
+  if (err) fp_dbg ("cvfp: clock sync control write failed (best effort): %s", err->message);
+  fpi_usb_transfer_unref (t);   /* fire-and-forget: the completion itself is the answer */
+}
+static guint32 cvfp_pack_timestamp (void){
+  time_t now = time (NULL); struct tm *lt = localtime (&now);
+  return ((guint32) (lt->tm_sec & 0x3f) << 26) | ((guint32) ((lt->tm_min & 0x3f) << 20)) |
+         ((guint32) (lt->tm_hour & 0x1f) << 15) | ((guint32) ((lt->tm_year + 1900 - 2000) & 0x3f) << 9) |
+         ((guint32) ((lt->tm_mon + 1) & 0x0f) << 5) | ((guint32) (lt->tm_mday & 0x1f));
+}
+/* build (not submit) the vendor/device 0x0d clock control transfer */
+static FpiUsbTransfer *new_clock_sync_transfer (FpDevice *dev){
+  guint32 ts = cvfp_pack_timestamp ();
+  fp_dbg ("cvfp: answering host-timestamp request (type 5) with packed %08x", ts);
+  FpiUsbTransfer *t = fpi_usb_transfer_new (dev);
+  fpi_usb_transfer_fill_control (t,
+                                 G_USB_DEVICE_DIRECTION_HOST_TO_DEVICE,
+                                 G_USB_DEVICE_REQUEST_TYPE_VENDOR,
+                                 G_USB_DEVICE_RECIPIENT_DEVICE,
+                                 0x0d, ts & 0xffff, ts >> 16, 0);
+  return t;
+}
+static void send_clock_sync (FpDevice *dev){
+  if (!fpi_device_get_usb_device (dev)) return;
+  fpi_usb_transfer_submit (new_clock_sync_transfer (dev), 1000, NULL, clock_sync_done, NULL);
+}
+
 /* --- asynchronous transceive: bulk OUT -> interrupt (reply length) -> bulk IN ----------------- */
 /* On success the result lands in self->rb/rlen/last_cv and the ssm jumps to `next`; any USB-level
    failure marks the ssm failed. Only one transceive is ever in flight (operations are serial). */
-typedef struct { FpiSsm *ssm; guint intr_ms; int next; } CvfpTsc;
+typedef struct { FpiSsm *ssm; guint intr_ms; int next; guint8 *frame; gsize n; } CvfpTsc;
 
 static void tsc_in_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err){
   FpiDeviceCvfp *self = FPI_DEVICE_CVFP (dev); CvfpTsc *x = ud; FpiSsm *ssm = x->ssm; int next = x->next;
@@ -144,13 +218,29 @@ static void tsc_in_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *er
   self->rlen = t->actual_length;
   memcpy (self->rb, t->buffer, self->rlen);
   self->last_cv = (self->rlen >= 24) ? (int) g32 (self->rb+20) : -1;
+  dump_bytes ("bulk reply", self->rlen, self->rb, sizeof self->rb);
+  fp_dbg ("cvfp: reply status@+20 = 0x%02x", self->rlen >= 24 ? (unsigned) g32 (self->rb+20) : 0);
   fpi_ssm_jump_to_state (ssm, next);
 }
 static void tsc_int_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err){
   FpiDeviceCvfp *self = FPI_DEVICE_CVFP (dev); CvfpTsc *x = ud;
   if (err) { FpiSsm *ssm = x->ssm; g_free (x); fpi_ssm_mark_failed (ssm, err); return; }
+  dump_bytes ("reply-listener intr (before rl parse)", t->actual_length, t->buffer, 32);
   guint32 rl = (t->actual_length >= 8) ? g32 (t->buffer+4) : 0;
-  if (rl == 0) {  /* no reply body: normal for the unwrapped 0x8A / 0x68 / 0x04 commands */
+  if (rl == 0) {  /* empty announcement: either an async chip event, or an unannounced reply */
+    if (t->actual_length >= 4)
+      self->last_event = (int) g32 (t->buffer);
+    if (self->last_event == 5) {
+      /* Do NOT answer mid-exchange: a synchronous control write here stalled and the
+         starved chip then also stalled the drain, the 0x6E commit and the teardown.
+         Generic commands flush it before the next request frame, sequentially (the write
+         completes before the OUT goes out). The verify match path answers at the instant
+         of the event (V_MATCH_RESP) and harvests the deferred reply in a listener window
+         (V_MATCH_REPLY). */
+      fp_dbg ("cvfp: host-timestamp request detected mid-exchange — deferring the clock sync");
+      self->pending_clock = TRUE;
+    }
+    fp_dbg ("cvfp: *** listener read an EMPTY interrupt (rl==0) → will report -3 ***");
     FpiSsm *ssm = x->ssm; int next = x->next; g_free (x);
     self->rlen = 0; self->last_cv = -3;
     fpi_ssm_jump_to_state (ssm, next); return;
@@ -161,6 +251,7 @@ static void tsc_int_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *e
 }
 static void tsc_out_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err){
   CvfpTsc *x = ud;
+  g_clear_pointer (&x->frame, g_free);   /* the OUT carried the frame copy; the heap copy is spent */
   if (err) { FpiSsm *ssm = x->ssm; g_free (x); fpi_ssm_mark_failed (ssm, err); return; }
   FpiUsbTransfer *ir = fpi_usb_transfer_new (dev);
   fpi_usb_transfer_fill_interrupt (ir, EP_INT, 32);
@@ -168,9 +259,33 @@ static void tsc_out_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *e
 }
 /* The command transfers deliberately get no GCancellable: they complete in milliseconds, and
    aborting one mid-flight is exactly what wedges this chip. Only the finger wait is cancellable. */
+/* When a deferred clock sync must be flushed before a new command, the vendor 0x0d
+   control write COMPLETES first and only then is the pending command's bulk OUT submitted —
+   submitting the answer and the 0x68 teardown OUT in the same instant leaves
+   the chip deaf to both (the teardown times out). The frame is copied to the heap because the
+   caller's stack buffer is gone by the time the control write completes. */
+static void tsc_clock_then_out (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err){
+  CvfpTsc *x = ud;
+  if (err) fp_dbg ("cvfp: deferred clock sync write failed (best effort, continuing): %s", err->message);
+  fpi_usb_transfer_unref (t);
+  FpiUsbTransfer *o = fpi_usb_transfer_new (dev);
+  fpi_usb_transfer_fill_bulk (o, EP_OUT, x->n);
+  memcpy (o->buffer, x->frame, x->n);
+  fp_dbg ("cvfp: clock sync answered — submitting the pending command frame");
+  fpi_usb_transfer_submit (o, TO_BULK, NULL, tsc_out_cb, x);
+}
 static void cvfp_transceive (FpDevice *dev, FpiSsm *ssm, const guint8 *frame, gsize n,
                              guint intr_ms, int next){
-  CvfpTsc *x = g_new0 (CvfpTsc, 1); x->ssm = ssm; x->intr_ms = intr_ms; x->next = next;
+  FpiDeviceCvfp *self = FPI_DEVICE_CVFP (dev);
+  CvfpTsc *x = g_new0 (CvfpTsc, 1);
+  x->ssm = ssm; x->intr_ms = intr_ms; x->next = next;
+  if (self->pending_clock) {   /* answer a mid-exchange type-5 request now (after the reply) */
+    self->pending_clock = FALSE;
+    fp_dbg ("cvfp: flushing deferred clock sync before the next request (sequential)");
+    x->n = n; x->frame = g_malloc (n); memcpy (x->frame, frame, n);
+    fpi_usb_transfer_submit (new_clock_sync_transfer (dev), 1000, NULL, tsc_clock_then_out, x);
+    return;   /* x belongs to the clock->OUT chain; tsc_out_cb frees the heap frame copy */
+  }
   FpiUsbTransfer *t = fpi_usb_transfer_new (dev);
   fpi_usb_transfer_fill_bulk (t, EP_OUT, n);
   memcpy (t->buffer, frame, n);
@@ -183,7 +298,20 @@ static void finger_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *er
   FpiDeviceCvfp *self = FPI_DEVICE_CVFP (dev); CvfpWait *w = ud; FpiSsm *ssm = w->ssm; int next = w->next;
   g_free (w);
   if (err) { fpi_ssm_mark_failed (ssm, err); return; }
+  dump_bytes ("finger-wait intr", t->actual_length, t->buffer, 32);
   self->last_event = (t->actual_length >= 4) ? (int) g32 (t->buffer) : -1;
+  if (self->last_event == 5) {
+    /* The clock request can arrive while we wait for a finger. Answer it and keep waiting —
+       the re-armed wait has no cancellable, so a cancel during this window unwinds at the
+       next 0x66/0x6C instead; that matches how cv3-tod's shared finger wait behaves. */
+    fp_dbg ("cvfp: host-timestamp request during finger wait — answering, continuing the wait");
+    send_clock_sync (dev);
+    CvfpWait *w2 = g_new0 (CvfpWait, 1); w2->ssm = ssm; w2->next = next;
+    FpiUsbTransfer *r = fpi_usb_transfer_new (dev);
+    fpi_usb_transfer_fill_interrupt (r, EP_INT, 32);
+    fpi_usb_transfer_submit (r, TO_FINGER, NULL, finger_cb, w2);
+    return;
+  }
   fpi_ssm_jump_to_state (ssm, next);
 }
 /* This is the one long wait, so it takes the device's GCancellable: when fprintd cancels the
@@ -197,6 +325,59 @@ static void cvfp_wait_finger (FpDevice *dev, FpiSsm *ssm, int next){
   fpi_usb_transfer_submit (t, TO_FINGER, fpi_device_get_cancellable (dev), finger_cb, w);
 }
 
+
+/* --- listener-only interrupt read --- receive a reply the chip announces WITHOUT the host
+   having sent a new command (used after the deferred clock answer on the event-only completion
+   path). Announcement [00 00 00 00 rl] -> read the rl-byte bulk body -> jump. Nothing/another
+   event in `ms` -> jump with last_cv = -3 / the event's id. This is NOT the retired bare drain:
+   cvfp_transceive itself arms the interrupt listener after every OUT, so the announcement the
+   chip may owe for the FINALIZE is only deliverable between exchanges --- exactly this window. */
+typedef struct { FpiSsm *ssm; int next; } CvfpLsn;
+static void lsns_in_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err){
+  FpiDeviceCvfp *self = FPI_DEVICE_CVFP (dev); CvfpLsn *x = ud; FpiSsm *ssm = x->ssm; int next = x->next;
+  g_free (x);
+  if (err) { fpi_ssm_mark_failed (ssm, err); return; }
+  self->rlen = t->actual_length;
+  memcpy (self->rb, t->buffer, self->rlen);
+  self->last_cv = (self->rlen >= 24) ? (int) g32 (self->rb+20) : -1;
+  dump_bytes ("finalize-listener bulk body", self->rlen, self->rb, sizeof self->rb);
+  fpi_ssm_jump_to_state (ssm, next);
+}
+static void lsns_int_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err){
+  FpiDeviceCvfp *self = FPI_DEVICE_CVFP (dev); CvfpLsn *x = ud;
+  if (err) { FpiSsm *ssm = x->ssm; g_free (x); fpi_ssm_mark_failed (ssm, err); return; }
+  dump_bytes ("finalize-listener intr", t->actual_length, t->buffer, 32);
+  guint32 rl = (t->actual_length >= 8) ? g32 (t->buffer+4) : 0;
+  int ev = (t->actual_length >= 4) ? (int) g32 (t->buffer) : 0;
+  if (ev == 5) {  /* another clock request: answer it and keep listening */
+    fp_dbg ("cvfp: finalize-listener: host-timestamp request --- answering, re-arming the window");
+    send_clock_sync (dev);
+    CvfpLsn *x2 = g_new0 (CvfpLsn, 1); x2->ssm = x->ssm; x2->next = x->next;
+    g_free (x);
+    FpiUsbTransfer *r = fpi_usb_transfer_new (dev);
+    fpi_usb_transfer_fill_interrupt (r, EP_INT, 32);
+    fpi_usb_transfer_submit (r, TO_LSN, NULL, lsns_int_cb, x2);
+    return;
+  }
+  if (rl == 0) {  /* nothing announced in the window (empty/event interrupt) */
+    FpiSsm *ssm = x->ssm; int next = x->next; g_free (x);
+    self->rlen = 0;
+    if (ev) self->last_event = ev;
+    self->last_cv = -3;
+    fp_dbg ("cvfp: finalize-listener: no announcement in the window (event 0x%02x)", ev);
+    fpi_ssm_jump_to_state (ssm, next); return;
+  }
+  FpiUsbTransfer *in = fpi_usb_transfer_new (dev);
+  fpi_usb_transfer_fill_bulk (in, EP_IN, rl > sizeof self->rb ? sizeof self->rb : rl);
+  fpi_usb_transfer_submit (in, TO_BULK, NULL, lsns_in_cb, x);
+}
+/* Arm the listener-only window. */
+static void cvfp_listen (FpDevice *dev, FpiSsm *ssm, guint ms, int next){
+  CvfpLsn *x = g_new0 (CvfpLsn, 1); x->ssm = ssm; x->next = next;
+  FpiUsbTransfer *t = fpi_usb_transfer_new (dev);
+  fpi_usb_transfer_fill_interrupt (t, EP_INT, 32);
+  fpi_usb_transfer_submit (t, ms, NULL, lsns_int_cb, x);
+}
 /* --- shared frame builders -------------------------------------------------------------------- */
 static int build_66 (FpiDeviceCvfp *self, guint8 *f){
   guint8 t[36] = {0,0,0,0,4,0,0,0,0,0,0,0,0,0,0,0,4,0,0,0,1,0,0,0,0,0,0,0,4,0,0,0,0x23,0,0,0};
@@ -237,23 +418,92 @@ static void fail_cv (FpiSsm *ssm, const char *what, int cv){
   fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
                                                       "cvfp: %s returned %d", what, cv));
 }
+/* The stored print body is one GVariant "ay" of 24 bytes: the 20-byte enroll id (legacy layout,
+   still parsed from old prints) followed by the 4-byte LE sensor template handle bound at commit
+   bound at commit. fprintd serializes fpi-data verbatim for RAW prints, so both survive a save/load
+   round-trip; fp_print_get_uid/fpi-uid does not exist in this libfprint (1.95.2+tod1). */
+#define CVFP_PRINT_BODY_LEN 24
+static gboolean
+cvfp_read_body (GVariant *ay, guint8 *body)
+{
+  /* A previous verify crash came from calling
+     g_variant_get_fixed_array (v, NULL, 1) with n_elements == NULL, and glib
+     rejects that unconditionally (g_return_val_if_fail (n_elements != NULL,
+     NULL)). The NULL was then dereferenced (body[20]): a
+     deterministic fprintd segfault. This reader never calls
+     g_variant_get_fixed_array; it iterates the 'ay' children
+     (g_variant_get_child_value + g_variant_get_byte), which works for every
+     variant form, and it is all-or-nothing (read into a temp buffer; body is
+     only touched on full success). */
+  guint8 tmp[CVFP_PRINT_BODY_LEN];
+  fp_dbg ("cvfp: cvfp_read_body: enter, ay=%p", (void *) ay);
+  if (!ay || !g_variant_is_of_type (ay, G_VARIANT_TYPE ("ay"))) {
+    fp_dbg ("cvfp: cvfp_read_body: not an 'ay' variant");
+    return FALSE;
+  }
+  gsize n = g_variant_n_children (ay);
+  if (n < CVFP_PRINT_BODY_LEN) {
+    fp_dbg ("cvfp: cvfp_read_body: only %u children (need %d)", (guint) n, CVFP_PRINT_BODY_LEN);
+    return FALSE;
+  }
+  for (gsize i = 0; i < CVFP_PRINT_BODY_LEN; i++) {
+    GVariant *c = g_variant_get_child_value (ay, i);
+    if (!c) {
+      fp_dbg ("cvfp: cvfp_read_body: child %u fetch failed", (guint) i);
+      return FALSE;
+    }
+    tmp[i] = g_variant_get_byte (c);
+    g_variant_unref (c);
+  }
+  memcpy (body, tmp, CVFP_PRINT_BODY_LEN);
+  fp_dbg ("cvfp: cvfp_read_body: ok: id=%02x%02x%02x%02x%02x… handle@20..23=%02x%02x%02x%02x",
+          body[0], body[1], body[2], body[3], body[4], body[20], body[21], body[22], body[23]);
+  return TRUE;
+}
+static guint32 print_get_handle (FpPrint *print){
+  /* Hardened via cvfp_read_body above — every pointer checked, every stage logged, and
+     no g_variant_get_fixed_array call with a NULL out-param (which returns NULL for
+     every variant and, once dereferenced at body[20], segfaults). */
+  GVariant *v = NULL;
+  guint32 h = 0;
+  fp_dbg ("cvfp: print_get_handle: print=%p", (void *) print);
+  if (!print) { fp_dbg ("cvfp: print_get_handle: NULL print"); return 0; }
+  g_object_get (print, "fpi-data", &v, NULL);
+  fp_dbg ("cvfp: print_get_handle: fpi-data=%p", (void *) v);
+  if (!v) return 0;
+  guint8 body[CVFP_PRINT_BODY_LEN] = {0};
+  if (cvfp_read_body (v, body))
+    h = body[20] | (body[21] << 8) | (body[22] << 16) | ((guint32) body[23] << 24);
+  g_variant_unref (v);
+  fp_dbg ("cvfp: print_get_handle: handle=0x%08x", h);
+  return h;
+}
 static void set_print_id (FpPrint *print, const guint8 *id20){
   /* Host-stored RAW print: fprintd serializes it to disk. The device holds the real template and
-     does the matching, so the print body is just a reference (we still stash the enroll id). */
+     does the matching, so the print body is a reference: enroll id + the sensor template handle
+     (zero here; enroll_done overwrites bytes 20..23 with the handle the 0x6E reply bound). */
   fpi_print_set_type (print, FPI_PRINT_RAW);
-  GVariant *v = g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, id20, 20, 1);
+  guint8 body[CVFP_PRINT_BODY_LEN] = {0};
+  memcpy (body, id20, 20);
+  GVariant *v = g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, body, CVFP_PRINT_BODY_LEN, 1);
   g_object_set (print, "fpi-data", v, NULL);
 }
 
 /* --- teardown ssm: optional 0x68 cancel, then 0x04 close-handle ------------------------------- */
 enum { TD_CANCEL, TD_CLOSE, TD_FIN, TD_NUM };
+#define TD_TIMEOUT (4 * TO_TEARDOWN)   /* a chip with a still-armed capture answers the 0x68 cancel slowly */
 static void td_run (FpiSsm *ssm, FpDevice *dev){
   FpiDeviceCvfp *self = FPI_DEVICE_CVFP (dev);
   guint8 f[128];
   switch (fpi_ssm_get_cur_state (ssm)) {
   case TD_CANCEL:
-    if (!GPOINTER_TO_INT (fpi_ssm_get_data (ssm))) { fpi_ssm_jump_to_state (ssm, TD_CLOSE); return; }
-    cvfp_transceive (dev, ssm, f, build_68_final (self,f), TO_TEARDOWN, TD_CLOSE);
+    if (self->e_dead_sess) {
+      fp_dbg ("cvfp: teardown: chip killed the session after 0x05 - skipping cancel/close (nothing to talk to)");
+      fpi_ssm_jump_to_state (ssm, TD_FIN);
+      return; }
+    /* after a mid-run SSM death the capture/enroll session is left armed and the chip is deaf to
+       the close until it is disarmed (that is what timed out in the traces) — always send 0x68; */
+    cvfp_transceive (dev, ssm, f, build_68_final (self,f), TD_TIMEOUT, TD_CLOSE);
     return;
   case TD_CLOSE:
     cvfp_transceive (dev, ssm, f, build_04_close (self,f), TO_TEARDOWN, TD_FIN);
@@ -360,8 +610,35 @@ static void open_done (FpiSsm *ssm, FpDevice *dev, GError *error){
   cvfp_open_fail (dev, error);
 }
 
-/* --- verify: 0x66 capture -> finger event -> 0x73 match --------------------------------------- */
-enum { V_CAP, V_CAP_RESP, V_CAP_RETRY, V_WAIT, V_MATCH, V_MATCH_RESP, V_ABORT, V_NUM };
+/* --- verify: 0x66 capture -> finger event -> 0x2F identify (attr 0x47) -> verdict -------------- */
+/* Per cv3-tod's vendor-blob disassembly + hardware measurements (2026-10-29): the hash-pointer
+   decides the command byte in the vendor code — 0x73 only in its hash form, which answers 0x0E;
+   the handle-array request with no hash is 0x2F/attr 0x47. CV3 constants are (0,4,handle),
+   (0,4,0x48), (0,4,0x53e2), (0,4,0), (2,4*count,handles...). The vendor's 0x148/0x7b0ad3 came
+   from ControlVault 2 reference material and do not occur in this chip's blob. Plaintext reply:
+   (0,4,verdict) (0,4,matched u32 handle) + 32-byte token; verdict word at +8, handle at +20. */
+enum { V_CAP, V_CAP_RESP, V_CAP_RETRY, V_WAIT, V_MATCH, V_MATCH_RESP, V_MATCH_REPLY, V_ABORT, V_NUM };
+
+typedef struct { FpiSsm *ssm; int round; int want_match; } CvfpDrain;
+static void drain_in_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err);  /* defined in the enroll section */
+static void start_drain (FpDevice *dev, FpiSsm *ssm, int want_match);                   /* defined after drain_in_cb */
+/* Decrypt the 0x2F reply sitting in self->rb and report the verdict — shared by the
+   normal announcement path (V_MATCH_RESP) and the deferred listener-window path
+   (V_MATCH_REPLY) so the binding rule lives in exactly one place. */
+static void verify_report_from_reply (FpiDeviceCvfp *self, FpiSsm *ssm, FpDevice *dev){
+  guint8 pt[512]; int pl = cvfp_unwrap (self, pt);
+  guint32 verdict = (pl >= 12) ? g32 (pt+8) : 0;
+  guint32 matched_id = (pl >= 24) ? g32 (pt+20) : 0;
+  fp_dbg ("cvfp: 0x2F verdict=%u matched_id=0x%08x (bound 0x%08x)", verdict, matched_id, self->print_handle);
+  /* cv3-tod id binding: accept only when the chip matched the exact template this print was
+     enrolled with — closes the cross-user prompt hole and the forged-flag hole. */
+  gboolean matched = (verdict == 1 && matched_id == self->print_handle);
+  /* verdict==0 with matched_id==0 is a genuine no-match (cv3-tod measured shape); anything else
+     without binding equality is treated as no-match — never as success. */
+  FpPrint *print = NULL; fpi_device_get_verify_data (dev, &print);
+  fpi_device_verify_report (dev, matched ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL, print, NULL);
+  fpi_ssm_mark_completed (ssm);
+}
 static void verify_run (FpiSsm *ssm, FpDevice *dev){
   FpiDeviceCvfp *self = FPI_DEVICE_CVFP (dev);
   guint8 f[256];
@@ -387,29 +664,50 @@ static void verify_run (FpiSsm *ssm, FpDevice *dev){
     cvfp_wait_finger (dev, ssm, V_MATCH);
     return;
   case V_MATCH: {
-    if (self->last_event != 0x03) { cvfp_transceive (dev, ssm, f, build_68_final (self,f), TO_TEARDOWN, V_ABORT); return; }
-    guint8 t[68] = {0,0,0,0,4,0,0,0,0,0,0,0, 0,0,0,0,4,0,0,0,0x48,0x01,0,0,
+    if (self->last_event != 0x03 && self->last_event != 5) { cvfp_transceive (dev, ssm, f, build_68_final (self,f), TO_TEARDOWN, V_ABORT); return; }
+    /* identify request (cv3-tod measured shape, TLV len 60, plaintext 96):
+       (0,4,handle)(0,4,0x48)(0,4,0x53e2)(0,4,0)(2,4,<template handle>); no hash entry —
+       the hash form is 0x73 and is not the identify path on this chip. */
+    guint8 t[60] = {0,0,0,0,4,0,0,0,0,0,0,0, 0,0,0,0,4,0,0,0,0x48,0,0,0,
                     0,0,0,0,4,0,0,0,0xe2,0x53,0,0, 0,0,0,0,4,0,0,0,0,0,0,0,
-                    2,0,0,0,4,0,0,0,0xd3,0x0a,0x7b,0, 3,0,0,0,0x14,0,0,0};
+                    2,0,0,0,4,0,0,0,0,0,0,0};
     p32 (t+8, self->handle);
-    int n = cvfp_build_wrapped (self,f,0x73,0x47,self->handle,t,68,112,self->wrap_seq);
+    p32 (t+56, self->print_handle);
+    int n = cvfp_build_wrapped (self,f,0x2F,0x47,self->handle,t,60,96,self->wrap_seq);
     if (n < 0) { fail_wrap (ssm); return; }
     cvfp_transceive (dev, ssm, f, n, TO_INTR, V_MATCH_RESP);
     return; }
   case V_MATCH_RESP: {
-    bump_seq (self);
-    if (self->last_cv != 0) { fail_cv (ssm, "0x73 match", self->last_cv); return; }
-    guint8 pt[512]; int pl = cvfp_unwrap (self, pt);
-    gboolean matched = (pl >= 12 && g32 (pt+8) == 1);   /* match flag at plaintext +8 (1 = match) */
-    fp_dbg ("cvfp: 0x73 match flag=%u", (pl >= 12) ? g32 (pt+8) : 0);
-    /* The device matches against its own template store, which only ever holds fingers we actually
-       enrolled — an unenrolled finger cannot produce matchflag=1 — so the flag is authoritative.
-       We do NOT compare template ids: the id 0x73 reports (a stable biometric-derived hash) lives
-       in a different id space from the per-enrollment id the 0x6C completion reply returns, so the
-       two never match. This is exactly why cvchan trusts the flag too. */
-    FpPrint *print = NULL; fpi_device_get_verify_data (dev, &print);
-    fpi_device_verify_report (dev, matched ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL, print, NULL);
-    fpi_ssm_mark_completed (ssm);
+    /* A valid-length announcement means the chip consumed the 0x2F — the reply advances
+       the wrapped counter exactly once, then the verdict is reported. */
+    if (self->last_cv == 0) { bump_seq (self); verify_report_from_reply (self, ssm, dev); return; }
+    /* The 0x2F's reply announcement can be REPLACED by a type-5
+       host-timestamp request — the exact shape the enrollment finalize already shows:
+       the chip consumed the command, wants the clock answered
+       FIRST, and announces the real reply only inside a listener-only window after the clock
+       answer (announcements are consumed by the listener armed per transceive; an OUT frame
+       steals them). Mirror the proven enroll pattern: bump the seq unconditionally (the
+       wrapped counter advances on the event-only 0x6C completion), answer the
+       clock at the instant of the event (every answer given at the moment of the event
+       landed; later answers were followed by total chip silence), then open the listener
+       window for the deferred 0x2F reply. */
+    if (self->last_cv == -3 && self->last_event == 5) {
+      self->wrap_seq++;   /* the chip consumed the 0x2F even though its announcement is deferred */
+      self->pending_clock = FALSE;   /* answered here — never re-answer or race it later */
+      fp_dbg ("cvfp: 0x2F announcement replaced by a type-5 clock request — answering now, listening for the deferred reply");
+      send_clock_sync (dev);
+      cvfp_listen (dev, ssm, TO_LSN, V_MATCH_REPLY);
+      return; }
+    bump_seq (self);   /* 0x0F refusal etc.: the old bump-then-fail behaviour for any other -3 */
+    fail_cv (ssm, "0x2F match", self->last_cv);
+    return; }
+  case V_MATCH_REPLY: {   /* the deferred 0x2F reply announced inside the listener window */
+    fp_dbg ("cvfp: deferred 0x2F reply listener returned: rlen=%u last_cv=%d last_event=0x%x",
+            (guint) self->rlen, self->last_cv, self->last_event);
+    if (self->last_cv != 0 || self->rlen < 24) {
+      fail_cv (ssm, "0x2F match (the deferred reply was never announced)", self->last_cv);
+      return; }
+    verify_report_from_reply (self, ssm, dev);   /* no extra seq bump: counted at V_MATCH_RESP */
     return; }
   case V_ABORT:
     fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO, "cvfp: no finger"));
@@ -420,19 +718,84 @@ static void verify_done (FpiSsm *ssm, FpDevice *dev, GError *error){
   fpi_device_verify_complete (dev, error);
 }
 static void dev_verify (FpDevice *dev){
+  FpiDeviceCvfp *self = FPI_DEVICE_CVFP (dev);
+  FpPrint *print = NULL;
+  fpi_device_get_verify_data (dev, &print);
+  /* The print body carries the sensor template handle — the binding. A print
+     without one (legacy sample-hash print) cannot be bound to a template, and any 0x2F built
+     from it would be a handle-0 identify: an invalid bind request. Fail before touching the
+     sensor; re-enroll to fix it. */
+  fp_dbg ("cvfp: dev_verify entered, print=%p", (void *) print);
+  self->print_handle = print_get_handle (print);   /* hardened helper handles NULL itself */
+  if (!print || !self->print_handle) {
+    fpi_device_verify_complete (dev, fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
+      "cvfp: print has no bound sensor template handle — re-enroll this finger"));
+    return;
+  }
+  self->print_bound = TRUE;
   fpi_ssm_start (fpi_ssm_new (dev, verify_run, V_NUM), verify_done);
 }
 
 /* --- enroll: 0x6D discard -> 0x8A start -> N x (0x66 -> finger -> 0x6C) -> 0x6E commit --------- */
 enum { EN_DISCARD, EN_START, EN_CAP, EN_CAP_RESP, EN_CAP_RETRY, EN_WAIT,
-       EN_UPDATE, EN_UPDATE_RESP, EN_COMMIT, EN_COMMIT_RESP, EN_NUM };
+       EN_UPDATE, EN_UPDATE_RESP, EN_UPDATE_DRAIN, EN_UPDATE_DRAIN_RESP, EN_FINALE, EN_COMMIT, EN_COMMIT_RESP, EN_NUM };
+
+/* Drain callback: ANY outcome keeps the SSM alive - a timeout on this speculative read is the
+   expected "event-only completion" case and just falls through to the commit. */
+static void drain_in_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err){
+  FpiDeviceCvfp *self = FPI_DEVICE_CVFP (dev); CvfpDrain *dr = ud; FpiSsm *ssm = dr->ssm;
+  /* dr stays alive across retry rounds; it is freed exactly once, on a terminal branch */
+  if (err) {  /* timeout: the chip defers its owed reply (template write etc.) - wait in rounds */
+    fp_dbg ("cvfp: drain round %d found nothing pending (%s)", dr->round, err->message);
+    g_error_free (err);
+    if (dr->round + 1 < 3) {
+      dr->round++;
+      FpiUsbTransfer *r = fpi_usb_transfer_new (dev);
+      fpi_usb_transfer_fill_bulk (r, EP_IN, sizeof self->rb);
+      fpi_usb_transfer_submit (r, TO_DRAIN, NULL, drain_in_cb, dr);
+      return;
+    }
+    g_free (dr);
+    self->rlen = 0; self->last_cv = 0;
+    fpi_ssm_jump_to_state (ssm, EN_UPDATE_DRAIN_RESP);   /* event-only completion (timeout rounds) */
+    return;
+  }
+  self->rlen = t->actual_length;
+  memcpy (self->rb, t->buffer, self->rlen);
+  self->last_cv = (self->rlen >= 24) ? (int) g32 (self->rb+20) : -1;
+  dump_bytes ("bulk reply (drain)", self->rlen, self->rb, sizeof self->rb);
+  fp_dbg ("cvfp: drain reply status@+20 = 0x%02x", self->rlen >= 24 ? (unsigned) g32 (self->rb+20) : 0);
+  {
+    g_free (dr);   /* terminal */
+    fpi_ssm_jump_to_state (ssm, EN_UPDATE_DRAIN_RESP);
+    return;
+  }
+}
+/* One shared entry point for reading an unannounced (deferred) bulk body (enroll-only).
+   want_match is kept for call-compatibility but must be 0: verify has no drain path. */
+/* The speculative bulk drain is retired — the bare bulk-in reads it performed (without a
+   preceding reply announcement) are the prime suspect for wedging the finalize window, and the
+   drain never yielded a byte in any run. Kept for protocol reference; not called. */
+__attribute__((unused)) static void start_drain (FpDevice *dev, FpiSsm *ssm, int want_match){
+  FpiDeviceCvfp *self = FPI_DEVICE_CVFP (dev);
+  CvfpDrain *dr = g_new0 (CvfpDrain, 1);
+  dr->ssm = ssm; dr->round = 0; dr->want_match = (want_match != 0);   /* enroll-only */
+  FpiUsbTransfer *t = fpi_usb_transfer_new (dev);
+  fpi_usb_transfer_fill_bulk (t, EP_IN, sizeof self->rb);
+  fpi_usb_transfer_submit (t, TO_DRAIN, NULL, drain_in_cb, dr);
+}
+
 static void enroll_run (FpiSsm *ssm, FpDevice *dev){
   FpiDeviceCvfp *self = FPI_DEVICE_CVFP (dev);
   guint8 f[256];
   switch (fpi_ssm_get_cur_state (ssm)) {
   case EN_DISCARD: {   /* drop any half-finished enrollment left on the chip */
-    self->e_spl = 0; self->e_accepted = 0; self->e_done = FALSE;
+    self->e_spl = 0; self->e_accepted = 0; self->e_done = FALSE; self->e_complete = 0; self->e_dead_sess = FALSE;
+    /* commit_tries is deliberately NOT reset here — it must survive the 0x8E restart so the
+       two-commit cap holds across passes. It is zeroed once per session in dev_open. */
+    self->print_handle = 0;   /* fresh binding per enroll — never carry a stale handle */
     memset (self->e_lastid, 0, 20);
+    self->e_announce_pending = FALSE;
     guint8 t[12] = {0,0,0,0,4,0,0,0,0,0,0,0}; p32 (t+8, self->handle);
     int n = cvfp_build_wrapped (self,f,0x6D,0x45,self->handle,t,12,48,self->wrap_seq);
     if (n < 0) { fail_wrap (ssm); return; }
@@ -445,11 +808,23 @@ static void enroll_run (FpiSsm *ssm, FpDevice *dev){
     return; }
   case EN_CAP:   /* top of the sample loop (0x8A is unwrapped: no seq bump) */
     self->did_retry = FALSE;
-    if (self->e_done || self->e_spl >= MAX_ENROLL_SAMPLES) { fpi_ssm_jump_to_state (ssm, EN_COMMIT); return; }
+    if (self->e_done || self->e_spl >= NR_ENROLL_STAGES - 1 || self->e_complete) {
+      /* After the final accepted update the chip is
+         re-armed with one more 0x66 and the FOLLOW-UP decides the branch: a refusal (0x85,
+         capture-armed after completion) routes to the commit, and a 0x00 ack (with a fresh
+         20-byte sample) routes back to the wait — matching the successful end-to-end flow
+         exactly (12 updates + a 13th capture arm). Driver-side guessing of the 13th update's
+         semantics produced three timed-out, chip-silent failures —
+         the chip, not the driver, declares the end. The sample hash
+         of an acking 13th poll is a plain extra sample of the same finger and is harmless. */
+      send_66 (dev, ssm, EN_CAP_RESP);
+      return; }
+    self->e_spl++;
     self->e_spl++;
     send_66 (dev, ssm, EN_CAP_RESP);
     return;
   case EN_CAP_RESP: {
+    fp_dbg ("cvfp: EN_CAP_RESP (0x66 ack) last_cv=%d", self->last_cv);
     bump_seq (self);
     if (self->last_cv == 0x85) {
       if (self->did_retry) { fail_cv (ssm, "0x66 capture", 0x85); return; }
@@ -469,7 +844,10 @@ static void enroll_run (FpiSsm *ssm, FpDevice *dev){
     cvfp_wait_finger (dev, ssm, EN_UPDATE);
     return;
   case EN_UPDATE: {
-    if (self->last_event != 0x03) { fpi_ssm_jump_to_state (ssm, EN_COMMIT); return; }
+    /* Event 5 during the wait is "template updated" — the session is live, do NOT treat it
+       as a dead session and abandon to commit (that route has never produced a successful commit
+       on this device; committed runs only ever arrived here after a finger event 0x03). */
+    if (self->last_event != 0x03 && self->last_event != 5) { fpi_ssm_jump_to_state (ssm, EN_COMMIT); return; }
     /* 20 zero-bytes between the 0x14 tag and the 2,0,0,0 TLV, so the 20-byte hash written at
        offset 20 lands clear of the tag (which must sit at offset 40) — exactly like cvchan.
        At 16 the command is malformed, the chip ignores it, and the interrupt wait wedges. */
@@ -481,26 +859,112 @@ static void enroll_run (FpiSsm *ssm, FpDevice *dev){
     cvfp_transceive (dev, ssm, f, n, TO_INTR, EN_UPDATE_RESP);
     return; }
   case EN_UPDATE_RESP: {
+    fp_dbg ("cvfp: EN_UPDATE_RESP (0x6C reply) last_cv=%d", self->last_cv);
     bump_seq (self);
     if (self->last_cv == 0 || self->last_cv == 0x8F) {
       self->e_accepted++;
       memcpy (self->e_lastid, self->e_hash, 20);
       FpPrint *print = NULL; fpi_device_get_enroll_data (dev, &print);
       fpi_device_enroll_progress (dev, self->e_accepted, print, NULL);
-      /* completion: the 0x6C reply carries a NEW 20-byte id (!= the sample hash we sent) */
+      /* The reply's (0,20) id is the chip's per-update confirmation — keep it for the 0x6E
+         commit frame (e_lastid), but it is not the template handle; the handle arrives in the
+         0x6E reply. */
       guint8 rpt[512]; int rpl = cvfp_unwrap (self, rpt); guint8 rid[20];
       if (rpl > 0 && cvfp_find_param (rpt, rpl, 20, rid) && memcmp (rid, self->e_hash, 20) != 0) {
         memcpy (self->e_lastid, rid, 20); self->e_done = TRUE; }
       fpi_ssm_jump_to_state (ssm, EN_CAP);
       return; }
     if (self->last_cv == 0x8C) { fpi_ssm_jump_to_state (ssm, EN_COMMIT); return; }  /* no more accepted */
-    if (self->last_cv < 0) { fail_cv (ssm, "0x6C update", self->last_cv); return; }
+    if (self->last_cv < 0) {
+      /* Some firmware ends the sample loop by sending an async event on EP_INT instead of a 0x6C
+         reply (observed on BCM58200: the final update is answered with event 0x05 "template
+         updated"). The chip consumed the command (its reply announcement never comes, but the
+         wrapped-counter advanced), so keep the wrap-seq in sync, count the sample as accepted
+         and go straight to commit — do NOT fail the enroll here. */
+      if (self->last_cv == -3 && self->last_event == 0x05) {
+        self->e_accepted++;
+        self->e_complete = 0x05;
+        self->e_announce_pending = TRUE;   /* give the chip a listener window to announce the
+                                              final reply (carrying the enrolment id) after the
+                                              clock is answered, before we commit */
+        fp_dbg ("cvfp: 0x6C answered by completion event 0x05 (rl==0) — treating as accepted stage %d", self->e_accepted);
+        fpi_ssm_jump_to_state (ssm, EN_UPDATE_DRAIN);
+        return;
+      }
+      fail_cv (ssm, "0x6C update", self->last_cv); return; }
     fpi_ssm_jump_to_state (ssm, EN_CAP);   /* 0xA4 / 0x89: retry this scan */
     return; }
+  case EN_UPDATE_DRAIN: {   /* post-completion housekeeping — bump seq, clock, listen, commit */
+    /* The chip consumed the 12th wrapped frame, so its wrap counter advanced even though the
+       reply listener read an empty (event) interrupt: bump the seq unconditionally, else the
+       commit would be MAC-invalid anyway. Then answer any deferred clock request, open the
+       listener window for the finalize announcement, then commit. */
+    self->wrap_seq++;   /* the chip consumed the 12th frame: bump unconditionally
+                           (bump_seq would skip it while last_cv is still -3) */
+    if (self->pending_clock) {   /* answer the completion event's clock request FIRST — every
+                                    answer given at the moment of the
+                                    event lands, while
+                                    answers given later are followed by total chip silence. */
+      self->pending_clock = FALSE;
+      fp_dbg ("cvfp: answering the completion event's deferred clock sync before commit");
+      send_clock_sync (dev);
+    }
+    /* Measured: 13 poll/update pairs, the completion
+       arriving event-only, the deferred clock answered, and the 0x6E commit racing out in the
+       SAME SECOND carrying the sample-hash fallback id. The commit was never announced
+       back — and per the measured commit rule a fallback-id commit is refused/
+       dropped material: "the enrolment id is the id to commit". In every committed run the host
+       held the real id in hand BEFORE 0x6E. The bare bulk drain never yielded a byte, but
+       it read WITH a command outstanding (chip silent by design); a listener-only window here
+       reads with nothing outstanding, right after the clock the chip asked for was satisfied.
+       If the chip finalizes asynchronously after the clock answer, its announcement is only
+       deliverable in this exact window (announcements are consumed by the listener armed per
+       transceive; an OUT frame steals it). Bounded TO_LSN window: announced reply ->
+       EN_UPDATE_DRAIN_RESP harvests the id into the commit frame; silence -> commit as before. */
+    if (self->e_announce_pending) {
+      self->e_announce_pending = FALSE;
+      fp_dbg ("cvfp: event-only completion — listening for the chip's deferred finalize reply before committing");
+      cvfp_listen (dev, ssm, TO_LSN, EN_UPDATE_DRAIN_RESP);
+      return;
+    }
+    fpi_ssm_jump_to_state (ssm, EN_COMMIT);
+    return; }
+  case EN_UPDATE_DRAIN_RESP: {   /* the finalize-listener window returned */
+    fp_dbg ("cvfp: finalize-listener result: %u bytes, last_cv=%d", (guint) self->rlen, self->last_cv);
+    if (self->last_cv == 0 && self->rlen >= 24) {   /* the chip announced and delivered a reply body */
+      guint8 rpt[512]; int rpl = cvfp_unwrap (self, rpt);
+      if (rpl > 0) {
+        guint8 rid[20];
+        if (cvfp_find_param (rpt, rpl, 20, rid) && memcmp (rid, self->e_hash, 20) != 0) {
+          memcpy (self->e_lastid, rid, 20); self->e_done = TRUE;
+          fp_dbg ("cvfp: deferred finalize reply carried an enrolment id %02x%02x%02x%02x%02x%02x… — committing with it",
+                  rid[0], rid[1], rid[2], rid[3], rid[4], rid[5]);
+        } else {
+          fp_dbg ("cvfp: deferred finalize reply carried no new id — committing with the accumulated e_lastid");
+        }
+      } else {
+        fp_dbg ("cvfp: deferred finalize reply failed to unwrap — committing with the accumulated e_lastid "
+                "(the announcement may predate the clock answer; wrap counter skew)");
+      }
+    } else {
+      /* nothing announced in the window: the chip went quiet after the clock answer. Commit with
+         what we have (the fallback id) — the 0x8E-restart stays as recovery. */
+      fp_dbg ("cvfp: no finalize announcement within %dms — committing with the accumulated e_lastid (e_done=%d e_complete=0x%x)",
+              TO_LSN, self->e_done, self->e_complete);
+    }
+    fpi_ssm_jump_to_state (ssm, EN_COMMIT);
+    return; }
+  case EN_FINALE:   /* retained for state-table stability; not reachable in the current flow */
+    fpi_ssm_mark_completed (ssm);
+    return;
+
   case EN_COMMIT: {
+    fp_dbg ("cvfp: EN_COMMIT e_accepted=%d e_done=%d e_complete=0x%x", self->e_accepted, self->e_done, self->e_complete);
     /* Commit if the device signalled completion, or (fallback, like cvchan) if we gathered enough
        accepted stages — so a run that never emits the explicit completion id still enrolls. */
-    if (!self->e_done && self->e_accepted < NR_ENROLL_STAGES) {
+    /* e_complete: this chip can end the sample loop via event 0x05 instead of a 0x6C completion
+       id, leaving e_accepted one short of the advertised stage count — that still counts. */
+    if (!self->e_done && !self->e_complete && self->e_accepted + 1 < NR_ENROLL_STAGES) {
       fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
         "cvfp: enrollment did not complete (%d/%d stages)", self->e_accepted, NR_ENROLL_STAGES));
       return; }
@@ -508,13 +972,50 @@ static void enroll_run (FpiSsm *ssm, FpDevice *dev){
                     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
                     2,0,0,0,0,0,0,0,2,0,0,0,0,0,0,0,3,0,0,0,0,0,0,0};
     p32 (t+8, self->handle); memcpy (t+20, self->e_lastid, 20);
+    /* Make the committed id visible in the log — a commit carrying the sample-hash
+       FALLBACK is expected to be refused (0x8E; the enrolment id is the
+       id to commit), so a silent/refused commit must be attributable to the id it carried. */
+    fp_dbg ("cvfp: 0x6E commit carries id %02x%02x%02x%02x%02x%02x… (e_done=%d e_complete=0x%x)",
+            self->e_lastid[0], self->e_lastid[1], self->e_lastid[2],
+            self->e_lastid[3], self->e_lastid[4], self->e_lastid[5],
+            self->e_done, self->e_complete);
+    self->commit_tries++;
     int n = cvfp_build_wrapped (self,f,0x6E,0x45,self->handle,t,64,96,self->wrap_seq);
     if (n < 0) { fail_wrap (ssm); return; }
     cvfp_transceive (dev, ssm, f, n, TO_INTR, EN_COMMIT_RESP);
     return; }
   case EN_COMMIT_RESP:
     bump_seq (self);
+    if (self->last_cv == 0x8E) {
+      /* The wrapped commit was refused — that is the unwedge path for a
+         chip left in "finalize pending" after an event-only completion (and for a commit that
+         carried the sample-hash fallback id). Either way the refusal ends the finalize wait. Drop
+         the armed frame and re-run the exchange once instead of failing the session; at most two
+         commits (this one and one more) guard against looping. */
+      fp_dbg ("cvfp: 0x6E commit refused (0x8E, try %d) — chip released from the finalize wait", self->commit_tries);
+      if (self->commit_tries >= 2) {
+        /* second refusal: give up cleanly — enroll_done gets the error and stores no print */
+        fail_cv (ssm, "0x6E commit (twice)", self->last_cv);
+        return; }
+      fp_dbg ("cvfp: re-running the enrollment exchange for a binding id");
+      self->e_spl = 0; self->e_accepted = 0; self->e_done = FALSE; self->e_complete = 0;
+      self->e_announce_pending = FALSE;   /* fresh exchange re-arms the window on its own completion */
+      fpi_ssm_jump_to_state (ssm, EN_DISCARD);
+      return; }
     if (self->last_cv != 0) { fail_cv (ssm, "0x6E commit", self->last_cv); return; }
+    /* Parse the wrapped 0x6E reply — (0,4,0) (0,4,<u32 handle>) (3,0) per cv3-tod — and bind
+       the sensor template handle into the print. This is the id 0x2F verify binds against; a
+       sample-hash id is never a valid bind (sample-hash commits are refused with 0x8E). */
+    {
+      guint8 rpt[512]; int rpl = cvfp_unwrap (self, rpt);
+      guint8 h[4];
+      if (rpl > 0 && cvfp_find_param (rpt, rpl, 4, h)) {
+        self->print_handle = g32 (h);
+        fp_dbg ("cvfp: 0x6E bound sensor template handle 0x%08x into the print", self->print_handle);
+      } else {
+        fp_dbg ("cvfp: 0x6E reply carried no u32 template handle — print stays unbound (verify will decline it)");
+      }
+    }
     fpi_ssm_mark_completed (ssm);
     return;
   }
@@ -524,6 +1025,30 @@ static void enroll_done (FpiSsm *ssm, FpDevice *dev, GError *error){
   if (error) { fpi_device_enroll_complete (dev, NULL, error); return; }
   FpPrint *print = NULL; fpi_device_get_enroll_data (dev, &print);
   set_print_id (print, self->e_lastid);
+  /* Also bind the sensor template handle the chip assigned at commit, so verify
+     can bind against it. An unbound print is a data-model error, not a soft-fail: verify with it
+     sends handle 0 and the chip cannot honour a request bound to nothing (cv3-tod measured). */
+  if (self->print_handle) {
+    /* Read the body with the contract-proof cvfp_read_body (no
+       g_variant_get_fixed_array anywhere on the read path); bytes 20..23 get the sensor
+       template handle the chip bound at commit (the 0x6E reply id); if the read
+       comes up short, bytes 0..19 are rebuilt from the enrolment id we still hold. */
+    GVariant *old; g_object_get (print, "fpi-data", &old, NULL);
+    guint8 body[CVFP_PRINT_BODY_LEN] = {0};
+    memcpy (body, self->e_lastid, 20);   /* the enroll id only — never old handle bytes */
+    if (old) {
+      cvfp_read_body (old, body);        /* all-or-nothing: body only rewritten on full read */
+      g_clear_pointer (&old, g_variant_unref);
+    } else {
+      fp_dbg ("cvfp: enroll_done: fpi-data gone post set_print_id — building body from e_lastid");
+    }
+    p32 (body + 20, self->print_handle);
+    GVariant *h = g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, body, CVFP_PRINT_BODY_LEN, 1);
+    g_object_set (print, "fpi-data", h, NULL);
+    fp_dbg ("cvfp: binding sensor handle 0x%08x into the stored print", self->print_handle);
+  } else {
+    fp_dbg ("cvfp: enroll completed without a bindable sensor handle — the print will not verify");
+  }
   fpi_device_enroll_complete (dev, g_object_ref (print), NULL);
 }
 static void dev_enroll (FpDevice *dev){
@@ -540,6 +1065,8 @@ static void dev_open (FpDevice *dev){
   g_autoptr(GError) err = NULL;
   if (!g_usb_device_claim_interface (usb, 0, 0, &err)) { cvfp_open_fail (dev, g_steal_pointer (&err)); return; }
   self->wrap_seq = 0; self->handle = 0;
+  self->print_handle = 0; self->print_bound = FALSE;   /* fresh session, fresh binding */
+  self->commit_tries = 0;   /* session-scoped 0x8E-restart budget (see EN_DISCARD) */
   if (!cvfp_gen_key (self)) {
     cvfp_open_fail (dev, fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL, "cvfp: keygen failed"));
     return;
@@ -568,11 +1095,13 @@ static void fpi_device_cvfp_class_init (FpiDeviceCvfpClass *klass){
   dc->id_table = id_table;
   dc->scan_type = FP_SCAN_TYPE_PRESS;
   dc->nr_enroll_stages = NR_ENROLL_STAGES;
-  /* Host storage: fprintd keeps the print metadata on disk and passes it back to verify. The
-     device stores the template internally for matching, and dev_verify trusts the device match
-     flag (the id it reports is a stable biometric hash we can't know at enroll time, so device
-     STORAGE/IDENTIFY/list would need a 0x2F store-diff to map ids — left as future work). */
+  /* Host storage: fprintd keeps the print metadata on disk and passes it back at verify. The
+     stored print's fpi-data carries the sensor template handle bound at commit;
+     dev_verify binds 0x2F to that handle. Device STORAGE/IDENTIFY/list remains future work. */
   dc->features = FP_DEVICE_FEATURE_VERIFY;
+  /* Verify is 0x2F identify with a bound handle; device-side matching with id binding means
+     the print's fpi-data carries the sensor template handle (20-byte enrolment id + u32
+     handle, the 24-byte print body described at cvfp_read_body). */
   dc->probe = dev_probe;
   dc->open  = dev_open;
   dc->close = dev_close;
