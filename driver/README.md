@@ -1,15 +1,47 @@
-# libfprint TOD driver (v2, in progress)
+# libfprint TOD driver
 
 A native `libfprint` TOD driver for the ControlVault 3 sensor, so `fprintd` + the GNOME/KDE
 fingerprint settings + `pam_fprintd` drive it directly — no `pam_cvfp` line, no `cvlock` watcher.
 Drop-in replacement for the stock (non-working) `libfprint-2-tod-1-broadcom.so`.
 
-**Status:** milestone 1 **confirmed on hardware** — `probe` + `open` (keyless ECDH handshake +
-channel) + `close` run inside `libfprint`/`fprintd`'s async stack (`libfprint sees 1 device …
-driver=cvfp … cvfp: secure channel open … OPEN OK`). The async integration — the one real
-unknown — works. Next: `verify`/`identify`, then `enroll`, then `list`/`delete`/`clear_storage`,
-each mapping the sequences in ../docs/secure-channel.md to the vfuncs the same way.
+**Status: working end to end on hardware.** `probe`, `open` (keyless ECDH handshake + channel),
+`enroll`, `verify` and `close` all run inside `libfprint`/`fprintd`'s async stack:
+`fprintd-enroll` completes and commits its enrollment, and `fprintd-verify` returns
+`verify-match` for an enrolled finger and `verify-no-match` for a different one. The chip's two
+stall traps — the host-timestamp interrupt and event-only completions (both documented in
+../docs/secure-channel.md) — are handled inside the driver. `list`/`delete`/`clear_storage`
+template management is future work.
 See [../docs/secure-channel.md](../docs/secure-channel.md) and [../ROADMAP.md](../ROADMAP.md).
+
+## Reading the fprintd journal
+With fprintd's debug output enabled, the driver logs everything under the `cvfp:` prefix (plus
+`[cvfp] O_NUM/V_NUM/TD_NUM entering state` state-machine lines). The greppable anchors, in a
+successful verify (captured under Arch Linux fprintd 1.94.5-2 with the MR applied; prefixes
+and hex tails trimmed):
+
+```
+[cvfp] O_NUM entering state 0                   # open handshake starts (0x23)
+cvfp: secure channel open (handle 0x2402cc00)   # ECDH handshake + 0x02 session open done
+[cvfp] V_NUM entering state 0                   # verify: 0x66 capture armed
+[cvfp] V_NUM completed successfully
+[cvfp] TD_NUM entering state 0                  # teardown: 0x68 disarm + 0x04 close
+[cvfp] TD_NUM completed successfully            # always check this on a Release/Release-fail
+```
+
+The line that carries the verdict:
+
+```
+cvfp: 0x2F verdict=1 matched_id=0x00b46b0f (bound 0x00b46b0f)
+```
+
+`verdict=1` is a match, `0` a no-match; `matched_id` must equal `bound` — a mismatch means the
+chip matched a different template than the print bound.
+
+The full signatures for the clock dance, cancel teardown, suspend handling and the wake probe
+are documented in
+[../docs/secure-channel.md](../docs/secure-channel.md) (Sleep/resume and other cancels section).
+If a claim produces no `[cvfp]` lines at all, the failure is upstream of the driver — fprintd
+or libfprint core, not here.
 
 ## Build
 ```bash
