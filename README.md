@@ -132,8 +132,10 @@ windows/       appendix: how it was discovered (NOT needed to use it)
 The libfprint TOD driver is **done** — `fprintd`, `pam_fprintd` and the desktop fingerprint
 panels all drive the sensor, with no custom PAM module and no watcher. See [ROADMAP.md](ROADMAP.md).
 
-*Last validated 2026-09-01 against `libfprint-tod` 1.94.8+tod1 / `fprintd` 1.94.5 on a Dell
-Latitude 5531.*
+*Last validated on a Dell Latitude 5531: `libfprint-tod` 1.94.8+tod1 / stock `fprintd` 1.94.5.*
+
+*Last validated on a Dell Latitude 7430: `libfprint-tod` 1.95.2+tod1 / Arch Linux fprintd 1.94.5-2 with
+MR !259 applied (MR tests backported for compatibility).*
 
 Where help is genuinely useful:
 

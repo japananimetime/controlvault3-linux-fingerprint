@@ -101,6 +101,22 @@ are followed by total chip silence. When a deferred answer must precede a new co
 control write completes before that command's bulk OUT is submitted — answering and sending in
 the same instant leaves the chip deaf to both.
 
+In the fprintd journal the whole dance looks like (Arch Linux fprintd 1.94.5-2 with the MR
+applied; debug output, prefixes trimmed):
+
+```
+cvfp: reply-listener intr (before rl parse): len=8 [ 05 00 00 00 00 00 00 00 ]
+cvfp: host-timestamp request detected mid-exchange — deferring the clock sync
+cvfp: 0x2F announcement replaced by a type-5 clock request — answering now, listening for the deferred reply
+cvfp: answering host-timestamp request (type 5) with packed bdc03579
+cvfp: deferred 0x2F reply listener returned: rlen=108 last_cv=0 last_event=0x5
+cvfp: 0x2F verdict=1 matched_id=0x00b46b0f (bound 0x00b46b0f)
+```
+
+The listener window can also catch the chip re-requesting a clock it did not receive mid-answer
+(`cvfp: finalize-listener: host-timestamp request --- answering, re-arming the window`); the
+driver records such a request instead of overlapping the in-flight answer write.
+
 ## Enrollment
 ```
 0x02 open  →  0x6D discard  →  0x8A start
@@ -144,12 +160,12 @@ An interrupted session (a killed process leaving a capture armed) wedges the com
 `echo 0 > /sys/bus/usb/devices/<dev>/authorized; sleep 2; echo 1 > .../authorized`.
 
 Do **not** use the port `disable` knob, and do **not** call `libusb_reset_device()` — they are the
-same USB port reset, and against an already-wedged chip both are *unrecoverable*. Measured
-2026-09-01: the `authorized` toggle re-enumerated the device fine at 17:32:09 (EP0 was healthy —
-only a bulk endpoint was stuck); `libusb_reset_device()` at 17:32:17 killed the BCM58200's USB
-stack outright; from 17:32:23 every enumeration returned `device descriptor read/64, error -110`,
-the kernel's own `usb usb3-port8: attempt power cycle` did nothing, and by 17:35:07 the port was
-`unable to enumerate USB device`. The chip is a soldered internal device fed from a mainboard
+same USB port reset, and against an already-wedged chip both are *unrecoverable*.
+Measured on the Latitude 5531: the `authorized` toggle re-enumerated the device fine (EP0 was
+healthy — only a bulk endpoint was stuck); `libusb_reset_device()` immediately afterwards killed
+the BCM58200's USB stack outright: every later enumeration returned `device descriptor read/64,
+error -110`, the kernel's own `usb usb3-port8: attempt power cycle` did nothing, and the port
+settled at `unable to enumerate USB device`. The chip is a soldered internal device fed from a mainboard
 rail rather than switchable port VBUS, so nothing but a full system power-down re-runs its
 firmware. **This, not the driver, is what every "needs a cold boot" has actually been.**
 
@@ -163,3 +179,92 @@ cancel the capture and close the session before exiting (so a cancelled prompt o
 wedge it), and on startup they detect a light wedge (`0x23` timeout) and auto-recover with the
 `authorized` toggle before retrying. Only an uncatchable `kill -9` mid-capture, or the rare deep
 wedge, still needs the manual reboot.
+
+
+### Sleep/resume and other cancels
+
+The driver runs its teardown (0x68 disarm + 0x04 close) whenever an operation is cancelled:
+a verify or enroll cancelled by VerifyStop, a lock screen or a suspend disarms the chip before
+the cancellation is reported, so the sensor is clean when fprintd releases the interface.
+Before that existed, a cancelled prompt left a capture armed with no live host session: the
+next open saw an empty 0x23 announcement (leftover sensor events fired first), or straight
+bulk-OUT timeouts; repeated Claims silently skipped the open sequence; and the command
+interface recovered by itself only after ~105 s of complete silence (measured on a Dell Latitude
+7430). An `authorized` 0/1 toggle recovers it at once (step 1 of the ladder
+above). With the fix, resume looks like any first open — open + verify in under a second.
+
+The healthy cancel-teardown, as it appears in the fprintd journal (Arch Linux fprintd 1.94.5-2
+with the MR applied; debug output, prefixes trimmed, hex elided after the command id where
+marked `…`):
+
+```
+[cvfp] SSM V_NUM failed in state 3 with error: Operation was cancelled
+cvfp: verify was cancelled mid-capture — disarming (0x68) and closing (0x04) before reporting
+[cvfp] TD_NUM entering state 0
+cvfp: reply-listener intr (before rl parse): len=8 [ 00 00 00 00 2c 00 00 00 ]
+cvfp: bulk reply: len=44 [ 01 00 00 00 2c 00 00 00 68 00 44 01 … ]
+cvfp: reply status@+20 = 0x00
+[cvfp] TD_NUM entering state 1
+cvfp: reply-listener intr (before rl parse): len=8 [ 00 00 00 00 2c 00 00 00 ]
+cvfp: bulk reply: len=44 [ 01 00 00 00 2c 00 00 00 04 00 40 05 … ]
+cvfp: reply status@+20 = 0x0e
+[cvfp] TD_NUM completed successfully
+```
+
+Both replies carry CV status `0x00` for the `0x68` disarm and `0x0e` for the `0x04` close — the
+`0x0e` is part of the normal close dance, not an error, and the teardown treats both as success.
+
+The host had its own wedge, which the driver cannot fix from below: while a device is
+suspended, libfprint refuses `fp_device_close()` with `BUSY`, so a client whose verify was
+cancelled by the suspend released fprintd's session but left libfprint's device open — and
+every later Claim failed with "The device has already been opened!" until the daemon
+restarted (upstream issues #173/#216). fprintd MR !259 raises the fix upstream ("close a
+device left open when Release is refused during suspend"; open/unmerged at the time of
+writing — validated on Arch Linux fprintd 1.94.5-2 with the MR applied, MR tests backported
+for compatibility): a Release refused that way completes anyway, the close is owed, and it runs
+on resume — the journal line to watch for is `closed unclaimed device`, after `Device 0
+is suspended, it will be closed on resume` at sleep. In that validation, suspend during an
+active verify, a following idle sleep/resume, and repeated sleep/wake cycles all recovered:
+post-resume Claims opened a fresh secure channel (`O_NUM entering state 0`) and
+verified in seconds.
+
+Related quirk, now tolerated: between operations the sensor can emit bare event interrupts
+(e.g. event 0x03 from a touch on the lock screen, right after a Release and just before the
+next 0x23 announcement). The open handshake's listener swallows up to 3 of those instead of
+misreading a bare event as an unannounced reply; announcements are delivered FIFO, so the
+queued one arrives in the re-armed window.
+
+### Clean-session resume freeze and EP0 wake retry
+
+Teardown-on-cancel is not the whole story: about fifteen minutes after a run of clean
+verifies (each ending in the full 0x68 disarm + 0x04 close teardown), the first Claim
+after a suspend died at the USB layer with "device was disconnected" — the
+suspend tore the interface away mid-handshake. After resume the chip was frozen harder
+than the earlier event wedge: the first bulk OUT of every open timed out after
+exactly 5 seconds with no interrupt at all, across twelve minutes and many Claims. An
+fprintd restart changed nothing (it reclaims the interface but never touches the chip),
+and there was no sign of the ~105 s self-recovery seen during the earlier event wedge. The lesson: a
+cleanly closed session does not prevent the freeze — it happens inside the chip across
+the suspend itself.
+
+The one lever that still worked was step 1 of the ladder: EP0 stays alive while the bulk
+endpoints NAK (proven by the authorized toggle re-enumerating the device). The driver
+now uses that: when the FIRST bulk OUT of the open handshake times out — no session
+handle exists yet, so this is ladder-safe by construction — it sends one benign EP0
+vendor control read (a dummy request the interface refuses; a STALL is as good an
+answer as data, since both prove the control path ran) and retries the 0x23 handshake
+exactly once. No reset, no port disable; the worst case is one extra 5-second timeout.
+The authorized 0/1 toggle (step 1 of the ladder above) remains the manual coarse fallback
+after a suspect resume.
+
+The wake probe has never fired in the field yet — both observed freezes pre-date it — so these
+are expected signatures rather than captured ones (the driver emits these lines verbatim):
+
+```
+cvfp: first open bulk OUT timed out — EP0 wake probe, then one 0x23 retry
+cvfp: EP0 wake probe answered (8 bytes) — control path alive
+cvfp: retrying the 0x23 handshake once
+```
+
+If instead the next line is the `got no answer` variant, EP0 did not survive either and the
+authorized toggle is the remaining ladder step.

@@ -13,6 +13,36 @@ stall traps — the host-timestamp interrupt and event-only completions (both do
 template management is future work.
 See [../docs/secure-channel.md](../docs/secure-channel.md) and [../ROADMAP.md](../ROADMAP.md).
 
+## Reading the fprintd journal
+With fprintd's debug output enabled, the driver logs everything under the `cvfp:` prefix (plus
+`[cvfp] O_NUM/V_NUM/TD_NUM entering state` state-machine lines). The greppable anchors, in a
+successful verify (captured under Arch Linux fprintd 1.94.5-2 with the MR applied; prefixes
+and hex tails trimmed):
+
+```
+[cvfp] O_NUM entering state 0                   # open handshake starts (0x23)
+cvfp: secure channel open (handle 0x2402cc00)   # ECDH handshake + 0x02 session open done
+[cvfp] V_NUM entering state 0                   # verify: 0x66 capture armed
+[cvfp] V_NUM completed successfully
+[cvfp] TD_NUM entering state 0                  # teardown: 0x68 disarm + 0x04 close
+[cvfp] TD_NUM completed successfully            # always check this on a Release/Release-fail
+```
+
+The line that carries the verdict:
+
+```
+cvfp: 0x2F verdict=1 matched_id=0x00b46b0f (bound 0x00b46b0f)
+```
+
+`verdict=1` is a match, `0` a no-match; `matched_id` must equal `bound` — a mismatch means the
+chip matched a different template than the print bound.
+
+The full signatures for the clock dance, cancel teardown, suspend handling and the wake probe
+are documented in
+[../docs/secure-channel.md](../docs/secure-channel.md) (Sleep/resume and other cancels section).
+If a claim produces no `[cvfp]` lines at all, the failure is upstream of the driver — fprintd
+or libfprint core, not here.
+
 ## Build
 ```bash
 gcc -shared -fPIC cvfp-tod.c -o libfprint-2-tod-1-cvfp.so \
