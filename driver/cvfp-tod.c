@@ -28,6 +28,7 @@
 #include <openssl/sha.h>
 #include <openssl/hmac.h>
 #include <openssl/evp.h>
+#include <string.h>   /* strstr: cvfp_is_cancel */
 #include <openssl/rand.h>
 #include <time.h>
 
@@ -41,6 +42,7 @@
    cancels the URB mid-flight and leaves the device's endpoint deep-wedged (survives a USB reset,
    needs a cold boot). The command-reply interrupt gets the same generous window cvchan uses. */
 #define TO_BULK    5000
+#define EP0_PROBE_REQ 0x44   /* dummy vendor byte; the interface stalls it (see wake probe) */
 #define TO_INTR   60000
 #define TO_FINGER 30000
 #define TO_TEARDOWN 3000
@@ -55,6 +57,7 @@ struct _FpiDeviceCvfp {
   guint8        master[20];
   guint         wrap_seq;
   guint32       handle;
+  gboolean      o_probe_tried; /* EP0 wake-probe budget: the 0x23 handshake gets one retry */
 
   /* last transceive result */
   guint8        rb[8192];
@@ -80,7 +83,9 @@ struct _FpiDeviceCvfp {
   guint8        e_lastid[20];
   gboolean      e_announce_pending; /* the final stage completed event-only; listen for the deferred finalize reply before committing */
   gboolean      pending_clock; /* a type-5 clock request arrived mid-exchange; answered at the event (match path) or flushed sequentially before the next command */
+  gboolean      clock_in_flight; /* a 0x0d clock answer write is submitted; a type-5 arriving meanwhile is recorded in pending_clock instead of overlapped. The transceive flush yields to this too: it skips the overlap and relies on the chip re-requesting */
   int           commit_tries;  /* how many 0x6E commits this session has sent (0x8E-restart guard) */
+  int           op_events;     /* bare chip events swallowed by the command listener this operation */
 
   GError       *open_error;   /* carried across the open-failure teardown ssm */
 };
@@ -179,9 +184,19 @@ static void dump_bytes (const char *tag, gsize actual, const guint8 *p, gsize bu
  * of the event instead of deferring (every answer given at the moment of the event
  * landed; later answers were followed by total chip silence). Only the finger
  * wait answers inline: there is no reply the chip owes while it waits for a finger. */
+/* USB transfer ownership: fpi_usb_transfer_submit() STEALS the caller's reference.
+ * Its doc: "(transfer full) ... will be stolen when this function is called ... free'ed
+ * automatically, after the callback ran unless fpi_usb_transfer_ref() is explicitly
+ * called" — so completion callbacks must NEVER unref their transfer. clock_sync_done
+ * used to, and every clock answer logged "fpi_usb_transfer_unref: assertion
+ * 'self->ref_count' failed" — twice per verify, visible in any debug journal capture.
+ * The same bug sat in tsc_clock_then_out and wake_probe_done, where it was worse:
+ * the transfer was read (t->actual_length) after the unref. */
 static void clock_sync_done (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err){
+  FpiDeviceCvfp *self = FPI_DEVICE_CVFP (dev);
+  self->clock_in_flight = FALSE;   /* cleared first, even on error — the write slot is free again */
   if (err) fp_dbg ("cvfp: clock sync control write failed (best effort): %s", err->message);
-  fpi_usb_transfer_unref (t);   /* fire-and-forget: the completion itself is the answer */
+  /* fire-and-forget: no unref — submit() already owns the reference (see above) */
 }
 static guint32 cvfp_pack_timestamp (void){
   time_t now = time (NULL); struct tm *lt = localtime (&now);
@@ -201,8 +216,15 @@ static FpiUsbTransfer *new_clock_sync_transfer (FpDevice *dev){
                                  0x0d, ts & 0xffff, ts >> 16, 0);
   return t;
 }
+/* Only one clock answer may be written at a time — two concurrent 0x0d control writes are
+ * exactly the "answering two things in the same instant leaves the chip deaf to both" hazard
+ * the clock protocol already documented. A type-5 arriving while an answer is still being
+ * written is recorded in pending_clock instead and answered at the next sequential flush
+ * (cvfp_transceive) or event slot, never overlapped. */
 static void send_clock_sync (FpDevice *dev){
+  FpiDeviceCvfp *self = FPI_DEVICE_CVFP (dev);
   if (!fpi_device_get_usb_device (dev)) return;
+  self->clock_in_flight = TRUE;
   fpi_usb_transfer_submit (new_clock_sync_transfer (dev), 1000, NULL, clock_sync_done, NULL);
 }
 
@@ -210,6 +232,16 @@ static void send_clock_sync (FpDevice *dev){
 /* On success the result lands in self->rb/rlen/last_cv and the ssm jumps to `next`; any USB-level
    failure marks the ssm failed. Only one transceive is ever in flight (operations are serial). */
 typedef struct { FpiSsm *ssm; guint intr_ms; int next; guint8 *frame; gsize n; } CvfpTsc;
+
+static void tsc_int_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err);  /* below */
+
+/* Re-arm the listener of an in-flight transceive with its ORIGINAL window — used when the first
+   interrupt turns out to be a bare chip event rather than the reply announcement. */
+static void tsc_listener_rearm (FpDevice *dev, CvfpTsc *x){
+  FpiUsbTransfer *r = fpi_usb_transfer_new (dev);
+  fpi_usb_transfer_fill_interrupt (r, EP_INT, 32);
+  fpi_usb_transfer_submit (r, x->intr_ms, NULL, tsc_int_cb, x);
+}
 
 static void tsc_in_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err){
   FpiDeviceCvfp *self = FPI_DEVICE_CVFP (dev); CvfpTsc *x = ud; FpiSsm *ssm = x->ssm; int next = x->next;
@@ -238,7 +270,23 @@ static void tsc_int_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *e
          of the event (V_MATCH_RESP) and harvests the deferred reply in a listener window
          (V_MATCH_REPLY). */
       fp_dbg ("cvfp: host-timestamp request detected mid-exchange — deferring the clock sync");
-      self->pending_clock = TRUE;
+      self->pending_clock = TRUE;   /* the flush never overlaps an in-flight answer (see cvfp_transceive); a re-armed request is answered there or re-requested */
+    }
+    /* The open handshake's listener is armed right after the interface claim, so it also sees
+       events the chip was still emitting from BEFORE the open — observed on the lock screen: a
+       touch fired event 0x03 right after the previous release, before the 0x23 announcement,
+       and the listener misread it as an empty reply (-3) and failed the open. A bare event is
+       not an unannounced reply: announcements are delivered FIFO, so after swallowing the event
+       the queued announcement arrives in the re-armed window (original timeout). Capped at 3
+       swallows per operation; real silence still falls through to the -3 path below. The
+       type-5 request is excluded — an announcement genuinely replaced by a clock request must
+       still surface as -3/event=5 for the match path to answer it at the event. */
+    if (self->last_event && self->last_event != 5 && self->op_events < 3) {
+      self->op_events++;
+      fp_dbg ("cvfp: listener swallowed bare chip event 0x%02x, re-arming for the announcement",
+              self->last_event);
+      tsc_listener_rearm (dev, x);
+      return;
     }
     fp_dbg ("cvfp: *** listener read an EMPTY interrupt (rl==0) → will report -3 ***");
     FpiSsm *ssm = x->ssm; int next = x->next; g_free (x);
@@ -266,8 +314,9 @@ static void tsc_out_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *e
    caller's stack buffer is gone by the time the control write completes. */
 static void tsc_clock_then_out (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err){
   CvfpTsc *x = ud;
+  FPI_DEVICE_CVFP (dev)->clock_in_flight = FALSE;   /* the flush's own clock write is done (even on error) */
   if (err) fp_dbg ("cvfp: deferred clock sync write failed (best effort, continuing): %s", err->message);
-  fpi_usb_transfer_unref (t);
+  /* no unref: submit() stole the reference (see clock_sync_done) */
   FpiUsbTransfer *o = fpi_usb_transfer_new (dev);
   fpi_usb_transfer_fill_bulk (o, EP_OUT, x->n);
   memcpy (o->buffer, x->frame, x->n);
@@ -281,10 +330,19 @@ static void cvfp_transceive (FpDevice *dev, FpiSsm *ssm, const guint8 *frame, gs
   x->ssm = ssm; x->intr_ms = intr_ms; x->next = next;
   if (self->pending_clock) {   /* answer a mid-exchange type-5 request now (after the reply) */
     self->pending_clock = FALSE;
-    fp_dbg ("cvfp: flushing deferred clock sync before the next request (sequential)");
-    x->n = n; x->frame = g_malloc (n); memcpy (x->frame, frame, n);
-    fpi_usb_transfer_submit (new_clock_sync_transfer (dev), 1000, NULL, tsc_clock_then_out, x);
-    return;   /* x belongs to the clock->OUT chain; tsc_out_cb frees the heap frame copy */
+    if (self->clock_in_flight) {
+      /* Only reachable if a previous answer's control write is still hanging (frozen-chip
+         territory — a healthy chip completes it in ms). Never overlap two 0x0d writes:
+         skip the flush, the chip re-requests what it did not receive, and that request
+         is answered at the next serialized instant-answer site. */
+      fp_dbg ("cvfp: clock answer still in flight — skipping the flush overlap (chip will re-request)");
+    } else {
+      self->clock_in_flight = TRUE;
+      fp_dbg ("cvfp: flushing deferred clock sync before the next request (sequential)");
+      x->n = n; x->frame = g_malloc (n); memcpy (x->frame, frame, n);
+      fpi_usb_transfer_submit (new_clock_sync_transfer (dev), 1000, NULL, tsc_clock_then_out, x);
+      return;   /* x belongs to the clock->OUT chain; tsc_out_cb frees the heap frame copy */
+    }
   }
   FpiUsbTransfer *t = fpi_usb_transfer_new (dev);
   fpi_usb_transfer_fill_bulk (t, EP_OUT, n);
@@ -305,7 +363,10 @@ static void finger_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *er
        the re-armed wait has no cancellable, so a cancel during this window unwinds at the
        next 0x66/0x6C instead; that matches how cv3-tod's shared finger wait behaves. */
     fp_dbg ("cvfp: host-timestamp request during finger wait — answering, continuing the wait");
-    send_clock_sync (dev);
+    if (!self->clock_in_flight) {   /* a second type-5 while one answer is being written: record and answer at the next flush instead */
+      self->pending_clock = TRUE;
+      send_clock_sync (dev);
+    }
     CvfpWait *w2 = g_new0 (CvfpWait, 1); w2->ssm = ssm; w2->next = next;
     FpiUsbTransfer *r = fpi_usb_transfer_new (dev);
     fpi_usb_transfer_fill_interrupt (r, EP_INT, 32);
@@ -315,9 +376,14 @@ static void finger_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *er
   fpi_ssm_jump_to_state (ssm, next);
 }
 /* This is the one long wait, so it takes the device's GCancellable: when fprintd cancels the
-   operation the transfer aborts at once instead of hanging until the timeout. The capture stays
-   armed on the chip, which is harmless — the next 0x66 gets 0x85 and the cancel+retry path below
-   clears it, and dev_close sends an explicit 0x68 anyway. */
+   operation the transfer aborts at once instead of hanging until the timeout. The failure is
+   NOT left there: verify_done/enroll_done watch for the cancellation and run the teardown SSM
+   (0x68 disarm + 0x04 close) BEFORE reporting, so a cancelled verify (cancel button, lock
+   screen, suspend) leaves the chip with no armed capture and no open session. Letting the armed
+   capture dangle across fprintd's Release + interface-drop wedges the command interface —
+   observed 2026-11-23 after a cancelled verify: the chip answered nothing (empty 0x23
+   announcement, then bulk-OUT timeouts) and only self-recovered after ~105 s of complete
+   silence, while fprintd's repeated re-Claims silently skipped the whole open sequence. */
 static void cvfp_wait_finger (FpDevice *dev, FpiSsm *ssm, int next){
   CvfpWait *w = g_new0 (CvfpWait, 1); w->ssm = ssm; w->next = next;
   FpiUsbTransfer *t = fpi_usb_transfer_new (dev);
@@ -349,9 +415,12 @@ static void lsns_int_cb (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *
   dump_bytes ("finalize-listener intr", t->actual_length, t->buffer, 32);
   guint32 rl = (t->actual_length >= 8) ? g32 (t->buffer+4) : 0;
   int ev = (t->actual_length >= 4) ? (int) g32 (t->buffer) : 0;
-  if (ev == 5) {  /* another clock request: answer it and keep listening */
+  if (ev == 5) {  /* another clock request: keep listening; answer only if no answer is being written */
     fp_dbg ("cvfp: finalize-listener: host-timestamp request --- answering, re-arming the window");
-    send_clock_sync (dev);
+    if (!self->clock_in_flight) {   /* a second type-5 while one answer is being written: record and answer at the next flush instead */
+      self->pending_clock = TRUE;
+      send_clock_sync (dev);
+    }
     CvfpLsn *x2 = g_new0 (CvfpLsn, 1); x2->ssm = x->ssm; x2->next = x->next;
     g_free (x);
     FpiUsbTransfer *r = fpi_usb_transfer_new (dev);
@@ -588,6 +657,39 @@ static void open_run (FpiSsm *ssm, FpDevice *dev){
     return;
   }
 }
+/* EP0 wake probe: after a resume from suspend this chip has now twice frozen with both bulk
+   endpoints NAKing for many minutes (2026-11-23 with a leftover capture, 2026-11-24 even
+   after a cleanly closed session — 5-second bulk-OUT timeouts, zero interrupts, no
+   self-recovery) while EP0 still answers: the authorized 0/1 toggle recovers the endpoints,
+   which proves the control path survives the freeze. So when the FIRST bulk OUT of the open
+   handshake times out (O state 0, before any session handle exists), poke the chip with one
+   benign EP0 control read — a dummy vendor request the interface refuses; a STALL is as good
+   an answer as data, both prove EP0 ran — then retry the 0x23 handshake exactly once.
+   Ladder-safe by construction: no reset, no port disable, worst case one extra 5-second
+   timeout. Same main-context async idiom as send_clock_sync. */
+static void open_done (FpiSsm *ssm, FpDevice *dev, GError *error);  /* below, calls cvfp_wake_probe */
+static void wake_probe_done (FpiUsbTransfer *t, FpDevice *dev, gpointer ud, GError *err){
+  /* no unref: submit() stole the reference (see clock_sync_done); the probe log
+   * reads t->actual_length and must do so BEFORE the transfer is freed, which
+   * happens automatically after this callback returns */
+  if (err) fp_info ("cvfp: EP0 wake probe got no answer: %s", err->message);
+  else fp_info ("cvfp: EP0 wake probe answered (%u bytes) — control path alive",
+                (unsigned) t->actual_length);
+  fp_info ("cvfp: retrying the 0x23 handshake once");
+  FpiDeviceCvfp *self = FPI_DEVICE_CVFP (dev);
+  self->o_probe_tried = TRUE;   /* armed only when the retry really starts */
+  fpi_ssm_start (fpi_ssm_new (dev, open_run, O_NUM), open_done);
+}
+static void cvfp_wake_probe (FpDevice *dev){
+  FpiUsbTransfer *t = fpi_usb_transfer_new (dev);
+  fpi_usb_transfer_fill_control (t,
+                                 G_USB_DEVICE_DIRECTION_DEVICE_TO_HOST,
+                                 G_USB_DEVICE_REQUEST_TYPE_VENDOR,
+                                 G_USB_DEVICE_RECIPIENT_DEVICE,
+                                 EP0_PROBE_REQ, 0, 0, 8);
+  fpi_usb_transfer_submit (t, 1000, NULL, wake_probe_done, NULL);
+}
+
 static void open_teardown_done (FpiSsm *ssm, FpDevice *dev, GError *td_error){
   FpiDeviceCvfp *self = FPI_DEVICE_CVFP (dev);
   g_clear_error (&td_error);              /* best effort: report the original open failure */
@@ -605,6 +707,16 @@ static void open_done (FpiSsm *ssm, FpDevice *dev, GError *error){
   if (self->handle) {
     self->open_error = error;
     cvfp_start_teardown (dev, FALSE, open_teardown_done);
+    return;
+  }
+  /* Resume freeze: a suspend that hit mid-open can leave both bulk endpoints NAKing for
+     minutes (2026-11-24: 'device was disconnected' at claim, then every open timing out
+     at the first bulk OUT with zero interrupts) while EP0 stays alive. Before reporting,
+     give the chip one EP0 wake probe through the still working control path and retry
+     the handshake exactly once — the probe fires only when no handle exists yet. */
+  if (!self->o_probe_tried) {
+    fp_info ("cvfp: first open bulk OUT timed out — EP0 wake probe, then one 0x23 retry");
+    cvfp_wake_probe (dev);
     return;
   }
   cvfp_open_fail (dev, error);
@@ -714,7 +826,31 @@ static void verify_run (FpiSsm *ssm, FpDevice *dev){
     return;
   }
 }
+static gboolean cvfp_is_cancel (const GError *e){
+  /* libfprint delivers the finger-wait abort as G_IO_ERROR/G_IO_ERROR_CANCELLED
+     ("Operation was cancelled"); accept the message as a fallback in case a wrapper
+     re-domains it. */
+  return e && (g_error_matches (e, G_IO_ERROR, G_IO_ERROR_CANCELLED) ||
+               (e->message && strstr (e->message, "cancelled")));
+}
+static void verify_report_cancelled (FpiSsm *ssm, FpDevice *dev, GError *td_error){
+  FpiDeviceCvfp *self = FPI_DEVICE_CVFP (dev);
+  /* the teardown SSM completed; report the original cancellation. */
+  g_clear_error (&td_error);
+  fpi_device_verify_complete (dev, g_steal_pointer (&self->open_error));
+}
 static void verify_done (FpiSsm *ssm, FpDevice *dev, GError *error){
+  FpiDeviceCvfp *self = FPI_DEVICE_CVFP (dev);
+  /* A cancelled run (finger-wait abort) must disarm the capture and close the session BEFORE
+     the verdict is reported: after fprintd sees the cancellation it Releases, and libfprint
+     drops the claimed interface with no further USB traffic to the chip. open_error carries
+     the failing error across the teardown SSM (same pattern as open_done's teardown). */
+  if (cvfp_is_cancel (error)) {
+    self->open_error = error;
+    fp_dbg ("cvfp: verify was cancelled mid-capture — disarming (0x68) and closing (0x04) before reporting");
+    cvfp_start_teardown (dev, TRUE, verify_report_cancelled);
+    return;
+  }
   fpi_device_verify_complete (dev, error);
 }
 static void dev_verify (FpDevice *dev){
@@ -733,6 +869,7 @@ static void dev_verify (FpDevice *dev){
     return;
   }
   self->print_bound = TRUE;
+  self->op_events = 0;                    /* fresh event-swallow budget for this operation's listeners */
   fpi_ssm_start (fpi_ssm_new (dev, verify_run, V_NUM), verify_done);
 }
 
@@ -1020,8 +1157,22 @@ static void enroll_run (FpiSsm *ssm, FpDevice *dev){
     return;
   }
 }
+static void enroll_report_cancelled (FpiSsm *ssm, FpDevice *dev, GError *td_error){
+  FpiDeviceCvfp *self = FPI_DEVICE_CVFP (dev);
+  g_clear_error (&td_error);
+  fpi_device_enroll_complete (dev, NULL, g_steal_pointer (&self->open_error));
+}
 static void enroll_done (FpiSsm *ssm, FpDevice *dev, GError *error){
   FpiDeviceCvfp *self = FPI_DEVICE_CVFP (dev);
+  /* Same contract as verify_done: a cancelled enroll (stuck read, pressed stop) disarms and
+     closes before the error is reported, so the Release that follows never leaves a live
+     session or an armed capture behind on the chip. */
+  if (cvfp_is_cancel (error)) {
+    self->open_error = error;
+    fp_dbg ("cvfp: enroll was cancelled mid-capture — disarming (0x68) and closing (0x04) before reporting");
+    cvfp_start_teardown (dev, TRUE, enroll_report_cancelled);
+    return;
+  }
   if (error) { fpi_device_enroll_complete (dev, NULL, error); return; }
   FpPrint *print = NULL; fpi_device_get_enroll_data (dev, &print);
   set_print_id (print, self->e_lastid);
@@ -1052,6 +1203,8 @@ static void enroll_done (FpiSsm *ssm, FpDevice *dev, GError *error){
   fpi_device_enroll_complete (dev, g_object_ref (print), NULL);
 }
 static void dev_enroll (FpDevice *dev){
+  FpiDeviceCvfp *self = FPI_DEVICE_CVFP (dev);
+  self->op_events = 0;                    /* fresh event-swallow budget for this operation's listeners */
   fpi_ssm_start (fpi_ssm_new (dev, enroll_run, EN_NUM), enroll_done);
 }
 
@@ -1064,9 +1217,11 @@ static void dev_open (FpDevice *dev){
   GUsbDevice *usb = fpi_device_get_usb_device (dev);
   g_autoptr(GError) err = NULL;
   if (!g_usb_device_claim_interface (usb, 0, 0, &err)) { cvfp_open_fail (dev, g_steal_pointer (&err)); return; }
+  self->op_events = 0;                    /* fresh event-swallow budget for the handshake listener */
   self->wrap_seq = 0; self->handle = 0;
   self->print_handle = 0; self->print_bound = FALSE;   /* fresh session, fresh binding */
   self->commit_tries = 0;   /* session-scoped 0x8E-restart budget (see EN_DISCARD) */
+  self->o_probe_tried = FALSE;   /* fresh open, fresh wake-retry budget */
   if (!cvfp_gen_key (self)) {
     cvfp_open_fail (dev, fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL, "cvfp: keygen failed"));
     return;
